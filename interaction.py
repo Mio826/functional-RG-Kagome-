@@ -1,6 +1,6 @@
 import numpy as np
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Tuple, Union
+from typing import Mapping, Optional, Tuple, Union
 
 SpinLike = Union[str, int]
 PatchSetMap = Mapping[SpinLike, object]
@@ -9,40 +9,54 @@ PatchSetMap = Mapping[SpinLike, object]
 @dataclass
 class BareExtendedHubbard:
     r"""
-    Bare extended Hubbard interaction for a *spin-conserving* kagome model.
+    Bare extended-Hubbard interaction for a spin-conserving kagome-like model.
 
-    This class is meant for the common situation where the noninteracting
-    Hamiltonian may depend on spin (for example Kane-Mele-type intrinsic SOC,
-    Zeeman splitting, or opposite flux for opposite spins), but **does not mix
-    spins**. In that case one can build separate patch sets for spin-up and
-    spin-down sectors, while the interaction remains the usual density-density
-    form
+    Physical setting
+    ----------------
+    The one-body Hamiltonian may depend on spin, but it must not mix spin-up and
+    spin-down sectors. Typical examples are intrinsic SOC, opposite flux for
+    opposite spins, or Zeeman-like splittings. In that situation one usually
+    constructs separate patch sets for the two spin sectors.
 
-        H_int = U \sum_{R,a} n_{Ra\uparrow} n_{Ra\downarrow}
-              + V \sum_{<Ra,R'b>} n_{Ra} n_{R'b}.
+    The interaction is the usual density-density form
 
-    Convention for the projected vertex:
+        H_int = U \sum_{R,a} n_{R a \uparrow} n_{R a \downarrow}
+              + V \sum_{<R a, R' b>} n_{R a} n_{R' b}.
 
-        V(k1,s1; k2,s2 -> k3,s3; k4,s4)
+    Important consequence for spin scattering
+    -----------------------------------------
+    Because the interaction is density-density, it does *not* flip spin. The
+    allowed bare process is therefore spin-conserving along each fermion line,
 
-    where the nonzero matrix elements for this density-density interaction are
-    spin-conserving along each fermion line,
+        s3 = s1,   s4 = s2.
 
-        s3 = s1,   s4 = s2,
+    However, that does *not* mean one should keep only opposite-spin scattering:
 
-    with:
-      - onsite U contributing only when s1 != s2,
-      - nearest-neighbor V contributing for both same-spin and opposite-spin
-        scattering.
+      - onsite U contributes only for opposite spins,
+      - nearest-neighbor V contributes for both opposite-spin and same-spin
+        scattering, because n_i n_j contains all spin combinations.
 
-    Parameters
-    ----------
-    U : float
-        Onsite Hubbard repulsion.
-    V : float
-        Nearest-neighbor density-density repulsion.
-    delta1, delta2, delta3 : array-like, shape (2,)
-        Kagome nearest-neighbor bond vectors for AB, AC, BC pairs.
+    Vertex conventions
+    ------------------
+    External labels are ordered as
+
+        (k1, u1, s1), (k2, u2, s2) -> (k3, u3, s3), (k4, u4, s4),
+
+    where each u_i is a three-component Bloch eigenvector in the kagome orbital
+    basis.
+
+    Two related vertices are exposed:
+
+      1. direct_band_vertex(...)
+         The raw density-density matrix element V_dir(1,2 -> 3,4).
+
+      2. antisym_band_vertex(...)
+         The fermionic antisymmetrized vertex
+
+             Gamma(1,2 -> 3,4) = V_dir(1,2 -> 3,4) - V_dir(1,2 -> 4,3).
+
+         This is the object that should be passed to channel decomposition and
+         later FRG flow equations.
     """
 
     U: float
@@ -57,7 +71,7 @@ class BareExtendedHubbard:
             if not hasattr(model, name):
                 raise AttributeError(
                     f"Model does not have attribute {name}. "
-                    "This class currently assumes kagome-style delta vectors."
+                    "This class assumes kagome nearest-neighbor bond vectors."
                 )
         return cls(
             U=float(U),
@@ -102,21 +116,14 @@ class BareExtendedHubbard:
         s4: SpinLike,
     ) -> np.ndarray:
         r"""
-        Return the 3x3 orbital-basis interaction kernel W_ab(q) for
+        Direct orbital-space kernel W_ab(q) for
 
             (k1,a,s1), (k2,b,s2) -> (k3,a,s3), (k4,b,s4),
 
         with q = k3 - k1.
 
-        For the density-density interaction used here:
-
-          1. Spin is conserved on each line, so nonzero only if
-                 s3 = s1 and s4 = s2.
-
-          2. Onsite U acts only for opposite spins, i.e. when s1 != s2.
-
-          3. Nearest-neighbor V acts for both same-spin and opposite-spin
-             scattering, because n_i n_j contains all spin combinations.
+        This is the *direct* density-density matrix element. It is intentionally
+        not antisymmetrized under exchange of outgoing legs.
         """
         s1 = self.normalize_spin(s1)
         s2 = self.normalize_spin(s2)
@@ -129,17 +136,41 @@ class BareExtendedHubbard:
 
         qab, qac, qbc = self._nn_form_factors(q)
 
-        # onsite U only for opposite spin
         if s1 != s2:
             np.fill_diagonal(W, self.U)
 
-        # NN V for any spin combination
         W[0, 1] = W[1, 0] = self.V * qab
         W[0, 2] = W[2, 0] = self.V * qac
         W[1, 2] = W[2, 1] = self.V * qbc
         return W
 
-    def band_vertex(
+    def _check_band_vectors(self, *vecs: np.ndarray) -> None:
+        for idx, u in enumerate(vecs, start=1):
+            u = np.asarray(u)
+            if u.ndim != 1 or u.shape[0] != self.Norb:
+                raise ValueError(
+                    f"u{idx} must be a length-{self.Norb} kagome eigenvector, got shape {u.shape}."
+                )
+
+    @staticmethod
+    def _check_momentum_conservation(
+        k1: np.ndarray,
+        k2: np.ndarray,
+        k3: np.ndarray,
+        k4: np.ndarray,
+        b1: np.ndarray,
+        b2: np.ndarray,
+        tol: float = 1e-7,
+    ) -> None:
+        G = np.asarray(k1) + np.asarray(k2) - np.asarray(k3) - np.asarray(k4)
+        B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
+        coeff = np.linalg.solve(B, G)
+        if not np.allclose(coeff, np.round(coeff), atol=tol):
+            raise ValueError(
+                "Momentum conservation violated: k1+k2-k3-k4 is not a reciprocal lattice vector."
+            )
+
+    def direct_band_vertex(
         self,
         k1: np.ndarray,
         u1: np.ndarray,
@@ -160,13 +191,13 @@ class BareExtendedHubbard:
         tol: float = 1e-7,
     ) -> complex:
         r"""
-        Single-band projected bare vertex for a spin-conserving kagome model.
+        Direct projected bare matrix element
 
-        The orbital-space kernel is first constructed as W_ab(q; s1,s2,s3,s4),
-        then projected with the three-component Bloch eigenvectors of the
-        corresponding spin sectors:
+            V_dir(k1,s1; k2,s2 -> k3,s3; k4,s4)
 
-            V_band = \sum_{a,b} u3_a^* u4_b^* W_ab(q) u2_b u1_a.
+        defined by
+
+            V_dir = sum_{a,b} u3_a^* u4_b^* W_ab(k3-k1) u2_b u1_a.
         """
         k1 = np.asarray(k1, dtype=float)
         k2 = np.asarray(k2, dtype=float)
@@ -177,26 +208,75 @@ class BareExtendedHubbard:
         u3 = np.asarray(u3, dtype=complex)
         u4 = np.asarray(u4, dtype=complex)
 
-        for idx, u in enumerate((u1, u2, u3, u4), start=1):
-            if u.ndim != 1 or u.shape[0] != self.Norb:
-                raise ValueError(
-                    f"u{idx} must be a length-{self.Norb} kagome eigenvector, got shape {u.shape}."
-                )
+        self._check_band_vectors(u1, u2, u3, u4)
 
         if check_momentum:
             if b1 is None or b2 is None:
                 raise ValueError("b1 and b2 must be provided when check_momentum=True.")
-            G = k1 + k2 - k3 - k4
-            B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
-            coeff = np.linalg.solve(B, G)
-            if not np.allclose(coeff, np.round(coeff), atol=tol):
-                raise ValueError(
-                    "Momentum conservation violated: k1+k2-k3-k4 is not a reciprocal lattice vector."
-                )
+            self._check_momentum_conservation(k1, k2, k3, k4, b1, b2, tol=tol)
 
         q = k3 - k1
         W = self.orbital_interaction_matrix(q, s1, s2, s3, s4)
         return np.einsum("a,b,ab,b,a->", np.conjugate(u3), np.conjugate(u4), W, u2, u1)
+
+    def antisym_band_vertex(
+        self,
+        k1: np.ndarray,
+        u1: np.ndarray,
+        s1: SpinLike,
+        k2: np.ndarray,
+        u2: np.ndarray,
+        s2: SpinLike,
+        k3: np.ndarray,
+        u3: np.ndarray,
+        s3: SpinLike,
+        k4: np.ndarray,
+        u4: np.ndarray,
+        s4: SpinLike,
+        *,
+        check_momentum: bool = False,
+        b1: Optional[np.ndarray] = None,
+        b2: Optional[np.ndarray] = None,
+        tol: float = 1e-7,
+    ) -> complex:
+        r"""
+        Fermionic antisymmetrized vertex
+
+            Gamma(1,2 -> 3,4) = V_dir(1,2 -> 3,4) - V_dir(1,2 -> 4,3).
+
+        With the present density-density direct matrix element, this is the
+        natural vertex to use in Cooper / particle-hole channel analysis.
+        """
+        if check_momentum:
+            if b1 is None or b2 is None:
+                raise ValueError("b1 and b2 must be provided when check_momentum=True.")
+            self._check_momentum_conservation(k1, k2, k3, k4, b1, b2, tol=tol)
+
+        direct = self.direct_band_vertex(
+            k1, u1, s1,
+            k2, u2, s2,
+            k3, u3, s3,
+            k4, u4, s4,
+            check_momentum=False,
+        )
+        exchange = self.direct_band_vertex(
+            k1, u1, s1,
+            k2, u2, s2,
+            k4, u4, s4,
+            k3, u3, s3,
+            check_momentum=False,
+        )
+        return direct - exchange
+
+    def band_vertex(self, *args, antisym: bool = True, **kwargs) -> complex:
+        r"""Backward-compatible wrapper.
+
+        By default this returns the antisymmetrized fermionic vertex.
+        Set ``antisym=False`` to obtain the raw direct matrix element instead.
+        """
+        if antisym:
+            return self.antisym_band_vertex(*args, **kwargs)
+        return self.direct_band_vertex(*args, **kwargs)
 
     def _patchset_for_spin(self, patchsets: PatchSetMap, spin: SpinLike):
         s = self.normalize_spin(spin)
@@ -224,18 +304,17 @@ class BareExtendedHubbard:
         p4: int,
         s4: SpinLike,
         *,
+        antisym: bool = True,
         check_momentum: bool = False,
     ) -> complex:
         r"""
-        Evaluate the projected bare vertex on four patch representatives,
-        where each external leg can belong to the spin-up or spin-down patch set.
+        Vertex evaluated on four patch representatives.
 
         Parameters
         ----------
-        patchsets : mapping
-            Typically {"up": patchset_up, "dn": patchset_dn}.
-        p1,s1,p2,s2,p3,s3,p4,s4 :
-            Patch indices and corresponding spin labels for the four legs.
+        antisym : bool, default True
+            Whether to return the fermionic antisymmetrized vertex Gamma or the
+            raw direct matrix element V_dir.
         """
         PS1 = self._patchset_for_spin(patchsets, s1)
         PS2 = self._patchset_for_spin(patchsets, s2)
@@ -247,13 +326,12 @@ class BareExtendedHubbard:
         P3 = PS3.patches[p3]
         P4 = PS4.patches[p4]
 
-        # For spin-conserving models considered here, the reciprocal lattice is
-        # the same in both spin sectors. We read it from PS1.
         return self.band_vertex(
             P1.k_cart, P1.eigvec, s1,
             P2.k_cart, P2.eigvec, s2,
             P3.k_cart, P3.eigvec, s3,
             P4.k_cart, P4.eigvec, s4,
+            antisym=antisym,
             check_momentum=check_momentum,
             b1=PS1.b1,
             b2=PS1.b2,
@@ -267,18 +345,26 @@ class BareExtendedHubbard:
         s3: SpinLike,
         s4: SpinLike,
         *,
+        antisym: bool = True,
         enforce_momentum: bool = False,
     ) -> np.ndarray:
         r"""
-        Build the full bare vertex tensor V[p1,p2,p3,p4] for a *fixed* choice of
-        spin labels (s1,s2,s3,s4).
+        Build the full patch vertex tensor for a fixed spin sector.
 
-        Example:
-            V_udud = interaction.patch_tensor(patchsets, 'up','dn','up','dn')
-            V_uuuu = interaction.patch_tensor(patchsets, 'up','up','up','up')
+        This returns either
 
-        This scales as O(Npatch^4) and is intended only for debugging / small
-        patch numbers.
+            V[p1,p2,p3,p4]
+
+        or
+
+            Gamma[p1,p2,p3,p4],
+
+        depending on ``antisym``.
+
+        Notes
+        -----
+        This scales as O(Npatch^4) and is intended for debugging or small patch
+        numbers only.
         """
         PS1 = self._patchset_for_spin(patchsets, s1)
         PS2 = self._patchset_for_spin(patchsets, s2)
@@ -301,6 +387,7 @@ class BareExtendedHubbard:
                                 P2.k_cart, P2.eigvec, s2,
                                 P3.k_cart, P3.eigvec, s3,
                                 P4.k_cart, P4.eigvec, s4,
+                                antisym=antisym,
                                 check_momentum=enforce_momentum,
                                 b1=PS1.b1,
                                 b2=PS1.b2,
@@ -308,58 +395,3 @@ class BareExtendedHubbard:
                         except ValueError:
                             out[p1, p2, p3, p4] = 0.0
         return out
-
-
-def make_cooper_pairs(patchset) -> np.ndarray:
-    r"""
-    For each patch p, find the patch pbar whose representative reduced momentum
-    is closest to -k_p (mod reciprocal lattice vectors).
-
-    This is only a helper for quick bare-level pairing diagnostics.
-    """
-    kred = np.array([p.k_red for p in patchset.patches])
-    pairs = np.zeros(patchset.Npatch, dtype=int)
-    for p in range(patchset.Npatch):
-        target = (-kred[p]) % 1.0
-        d2 = np.sum((kred - target[None, :]) ** 2, axis=1)
-        pairs[p] = int(np.argmin(d2))
-    return pairs
-
-
-def build_cooper_pairing_kernel(
-    patchsets: PatchSetMap,
-    interaction: BareExtendedHubbard,
-    *,
-    s1: SpinLike = "up",
-    s2: SpinLike = "dn",
-) -> np.ndarray:
-    r"""
-    Build a simple bare Cooper kernel
-
-        K[p, p'] = V(p,s1; pbar,s2 -> p',s1; p'bar,s2),
-
-    where pbar and p'bar approximate the opposite momenta in the corresponding
-    spin sectors.
-
-    For a spin-conserving Kane-Mele-type setup, the most common choice is the
-    opposite-spin kernel (s1='up', s2='dn').
-    """
-    PS1 = interaction._patchset_for_spin(patchsets, s1)
-    PS2 = interaction._patchset_for_spin(patchsets, s2)
-    pairs1 = make_cooper_pairs(PS1)
-    pairs2 = make_cooper_pairs(PS2)
-
-    K = np.zeros((PS1.Npatch, PS1.Npatch), dtype=complex)
-    for p in range(PS1.Npatch):
-        pb = pairs2[pairs1[p] % PS2.Npatch] if PS1.Npatch != PS2.Npatch else pairs2[p]
-        for pp in range(PS1.Npatch):
-            ppb = pairs2[pairs1[pp] % PS2.Npatch] if PS1.Npatch != PS2.Npatch else pairs2[pp]
-            K[p, pp] = interaction.patch_vertex(
-                patchsets,
-                p, s1,
-                pb, s2,
-                pp, s1,
-                ppb, s2,
-                check_momentum=False,
-            )
-    return K

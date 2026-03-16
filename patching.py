@@ -48,10 +48,19 @@ class FSPatcher:
     """
     Unified first-BZ contour-based patcher for 2D kagome-like models.
 
-    Robust features:
-      - Always works inside the hexagonal 1st BZ
-      - Scores contours by closure / length / enclosure of target point
-      - Automatically tries tiny contour-level shifts to avoid van Hove degeneracies
+    Important convention
+    --------------------
+    - If orbital_slice is None:
+        patch the full model, and band_index is the global band index.
+    - If orbital_slice is not None:
+        patch only that block, and band_index is the LOCAL band index
+        inside the selected block.
+
+    Example for a 6x6 spin-conserving kagome model:
+        orbital_slice = slice(0, 3)  -> first 3x3 block
+        orbital_slice = slice(3, 6)  -> second 3x3 block
+
+        then band_index should be 0, 1, or 2.
     """
 
     def __init__(
@@ -127,17 +136,61 @@ class FSPatcher:
         return self.red_to_cart(self.wrap_red(self.cart_to_red(k)))
 
     # ------------------------
+    # sector / band helpers
+    # ------------------------
+    def _full_hamiltonian(self, kx: float, ky: float) -> np.ndarray:
+        return np.asarray(self.model.Hk(kx, ky), dtype=complex)
+
+    def _sector_hamiltonian(self, kx: float, ky: float) -> np.ndarray:
+        """
+        Hamiltonian seen by the patcher.
+        If orbital_slice is None, use the full Hamiltonian.
+        If orbital_slice is set, restrict to that block.
+        """
+        H = self._full_hamiltonian(kx, ky)
+        if self.orbital_slice is None:
+            return H
+        return H[self.orbital_slice, self.orbital_slice]
+
+    def _sector_eigenstate(self, kx: float, ky: float):
+        """
+        Eigen-decomposition in the sector seen by the patcher.
+        """
+        H = self._sector_hamiltonian(kx, ky)
+        evals, evecs = np.linalg.eigh(H)
+        return evals, evecs
+
+    def _validate_band_index(self, nband: int):
+        if not (0 <= self.band_index < nband):
+            raise ValueError(
+                f"band_index={self.band_index} out of range for current sector "
+                f"with {nband} bands."
+            )
+
+    # ------------------------
     # band / eigvec / mu
     # ------------------------
     def band_energy(self, kx: float, ky: float) -> float:
-        evals, _ = self.model.eigenstate(kx, ky)
+        evals, _ = self._sector_eigenstate(kx, ky)
+        self._validate_band_index(len(evals))
         return float(evals[self.band_index])
 
     def band_eigvec(self, kx: float, ky: float) -> np.ndarray:
-        _, evecs = self.model.eigenstate(kx, ky)
-        return np.asarray(evecs[:, self.band_index])
+        _, evecs = self._sector_eigenstate(kx, ky)
+        self._validate_band_index(evecs.shape[1])
+        return np.asarray(evecs[:, self.band_index], dtype=complex)
 
     def get_mu(self) -> float:
+        """
+        Keep the same convention as before:
+        - explicit mu is used directly
+        - otherwise ask the full model for EF_from_filling
+
+        Note:
+        for spinful sector-patching this is a pragmatic choice.
+        If later you want true sector-resolved filling control, that should be
+        implemented separately.
+        """
         if self.mu is not None:
             return float(self.mu)
         return float(self.model.EF_from_filling(self.filling))
@@ -156,7 +209,7 @@ class FSPatcher:
         return np.array([vx, vy], dtype=float)
 
     def orbital_weight(self, eigvec: np.ndarray) -> np.ndarray:
-        vec = eigvec if self.orbital_slice is None else eigvec[self.orbital_slice]
+        vec = np.asarray(eigvec, dtype=complex)
         w = np.abs(vec) ** 2
         s = np.sum(w)
         if s > 0:
@@ -417,11 +470,11 @@ class FSPatcher:
 
         patches = []
         for pid, k0 in enumerate(reps):
-            kf = self.project_to_fs(k0, mu)  # 注意：投回真实 mu，而不是 shifted mu
+            kf = self.project_to_fs(k0, mu)  # project back to the true mu, not shifted contour level
             uv = self.wrap_red(self.cart_to_red(kf))
             e = self.band_energy(kf[0], kf[1])
             vf = self.fermi_velocity(kf[0], kf[1])
-            eig = self.band_eigvec(kf[0], kf[1])
+            eig = self.band_eigvec(kf[0], kf[1])   # already sector-local if orbital_slice is set
             w = self.orbital_weight(eig)
 
             patches.append(
