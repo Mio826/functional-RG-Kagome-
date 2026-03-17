@@ -1,0 +1,383 @@
+# Full Benchmark Report: Patch-Based FRG Pipeline with Bloch Gauge Fix
+
+---
+
+# 0. Purpose of This Document
+
+This document provides a **complete, reproducible, and physically interpretable benchmark record** of the patch-based FRG preprocessing pipeline.
+
+It is designed to:
+
+* Ensure correctness of all modules
+* Diagnose and fix Bloch gauge issues
+* Provide a stable foundation for future FRG flow and instability analysis
+* Serve as a handoff document for future development (human or AI)
+
+---
+
+# 1. Pipeline Structure
+
+The full pipeline consists of **five stages**, each validated by a dedicated notebook:
+
+| Stage | File                                | Purpose                           |
+| ----- | ----------------------------------- | --------------------------------- |
+| 1     | `01_noninteracting_benchmark.ipynb` | Validate band structure           |
+| 2     | `02_patching_benchmark.ipynb`       | Construct Fermi surface patches   |
+| 3     | `03_interaction_benchmark.ipynb`    | Project interaction to band basis |
+| 4     | `04_channels_benchmark.ipynb`       | Build channel kernels             |
+| 5     | `05_bloch_gauge_benchmark.ipynb`    | Validate gauge consistency        |
+
+---
+
+# 2. Stage-by-Stage Benchmark Details
+
+---
+
+## 2.1 Non-Interacting Model Benchmark
+
+### Goal
+
+Validate that the tight-binding Hamiltonian is correct.
+
+### Tests Performed
+
+* Band structure along high-symmetry path
+* 2D dispersion in Brillouin zone
+* Spin degeneracy (if applicable)
+* Symmetry checks (TR, inversion)
+
+### Key Observations
+
+* Bands match expected Kagome structure
+* Degeneracy behaves correctly depending on model
+* No numerical instability
+
+### Conclusion
+
+✔ Hamiltonian implementation is correct
+✔ Eigenvectors are valid (but gauge undefined)
+
+---
+
+## 2.2 Patching Benchmark
+
+### Goal
+
+Construct Fermi surface patches and extract eigenvectors.
+
+### Tests Performed
+
+* Patch positions lie on FS
+* Patch ordering is continuous
+* Eigenvectors extracted for each patch
+
+### Problem Observed
+
+Bloch eigenvectors exhibit:
+
+* random U(1) phase
+* discontinuous jumps between neighboring patches
+* overlap phase ~0 or ~π
+
+### Physical Meaning
+
+This is expected:
+
+[
+|u_k\rangle \rightarrow e^{i\theta(k)} |u_k\rangle
+]
+
+But causes issues downstream.
+
+### Conclusion
+
+✔ Patching geometry correct
+⚠ Gauge structure problematic
+
+---
+
+## 2.3 Interaction Benchmark
+
+### Goal
+
+Project interaction into band (patch) basis.
+
+### Tests Performed
+
+Evaluate:
+
+[
+\Gamma(p_1,p_2,p_3,p_4)
+]
+
+for:
+
+* direct channel
+* antisymmetrized channel
+
+### Observations
+
+* Values are finite and stable
+* Interface with patching works
+
+### Hidden Issue
+
+Projected vertex depends on eigenvector phase:
+
+[
+\Gamma \sim u^* u^* u u
+]
+
+So:
+
+* Not gauge invariant
+* Sensitive to patch phase randomness
+
+### Conclusion
+
+✔ Implementation correct
+⚠ Gauge sensitivity exists
+
+---
+
+## 2.4 Channel Benchmark
+
+### Goal
+
+Construct channel kernels (e.g. pp channel).
+
+### Tests Performed
+
+* Kernel matrix construction
+* Hermiticity check
+* Eigenvalue / singular value spectrum
+
+### Observations
+
+* Kernel is well-formed
+* Spectrum stable
+
+### Hidden Issue
+
+Entrywise kernel depends on gauge
+
+But:
+
+* Spectrum appears stable
+
+### Conclusion
+
+✔ Kernel construction correct
+⚠ Need formal gauge validation
+
+---
+
+# 3. Core Problem: Bloch Gauge Inconsistency
+
+---
+
+## 3.1 Nature of the Problem
+
+Eigenvectors from diagonalization are defined up to:
+
+[
+|u_k\rangle \rightarrow e^{i\theta(k)} |u_k\rangle
+]
+
+Across patches:
+
+* θ(k) is random
+* leads to discontinuous gauge
+
+---
+
+## 3.2 Observed Symptoms
+
+* Patch overlap phase jumps ~π
+* Vertex entries fluctuate
+* Kernel entries fluctuate
+* Form factors noisy
+
+---
+
+## 3.3 Important Insight
+
+This is NOT a bug.
+
+It is:
+
+> A representation-level ambiguity (gauge freedom)
+
+But:
+
+> It must be controlled for numerical stability.
+
+---
+
+# 4. Solution: Parallel Transport Gauge Fix
+
+---
+
+## 4.1 Method
+
+For ordered patches:
+
+[
+|u_{p+1}\rangle \rightarrow e^{-i \arg(\langle u_p | u_{p+1} \rangle)} |u_{p+1}\rangle
+]
+
+---
+
+## 4.2 Effect
+
+Ensures:
+
+[
+\langle u_p | u_{p+1} \rangle \in \mathbb{R}^+
+]
+
+---
+
+## 4.3 Interpretation
+
+This constructs a:
+
+> Smooth gauge (continuous frame) along FS contour
+
+---
+
+# 5. Gauge Benchmark Results (Core Validation)
+
+---
+
+## 5.1 Patch Continuity
+
+| Metric          | Raw   | Fixed  |
+| --------------- | ----- | ------ |
+| Mean phase jump | ~0.87 | ~1e-32 |
+| Max phase jump  | ~π    | ~1e-32 |
+
+✔ Perfect smoothing
+
+---
+
+## 5.2 Vertex Gauge Covariance
+
+Expected:
+
+[
+\Gamma \rightarrow e^{-i\theta_3} e^{-i\theta_4} e^{i\theta_2} e^{i\theta_1} \Gamma
+]
+
+Results:
+
+* Raw difference: large
+* Covariance residual: ~0
+* |Γ| invariant: ~1e-16
+
+✔ Correct gauge covariance
+
+---
+
+## 5.3 Channel Kernel Validation
+
+Results:
+
+| Quantity            | Result             |
+| ------------------- | ------------------ |
+| Entrywise diff      | large              |
+| Singular values     | invariant (~1e-14) |
+| Covariance residual | ~1e-15             |
+| Hermitian error     | ~1e-16             |
+
+✔ Kernel physically invariant
+✔ Numerical structure stable
+
+---
+
+# 6. Key Physical Conclusions
+
+---
+
+## 6.1 What is NOT gauge invariant
+
+* Individual vertex entries
+* Kernel matrix elements
+* Eigenvectors of kernel
+
+---
+
+## 6.2 What IS gauge invariant
+
+* |Γ|
+* Kernel spectrum
+* Leading instability eigenvalues
+
+---
+
+## 6.3 Role of Gauge Fix
+
+Gauge fix:
+
+* does NOT change physics
+* DOES improve numerical smoothness
+* DOES stabilize interpretation
+
+---
+
+# 7. Final Validation Summary
+
+* Total tests: 8
+* PASS: 8
+* FAIL: 0
+
+All validations passed at machine precision.
+
+---
+
+# 8. Final Decision
+
+The new patching module with gauge fix:
+
+✔ Physically correct
+✔ Numerically stable
+✔ Fully compatible with pipeline
+
+### → Adopt as default implementation
+
+---
+
+# 9. Remaining Subtlety (IMPORTANT)
+
+Even after gauge fix:
+
+* Kernel eigenvectors (form factors) are still gauge dependent
+
+This affects:
+
+* Order parameter interpretation
+* Visualization of pairing symmetry
+
+---
+
+# 10. Recommended Next Steps
+
+1. Define gauge-invariant observables for form factors
+2. Or fix global phase convention for eigenmodes
+3. Validate instability classification robustness
+
+---
+
+# 11. Final Takeaway
+
+The issue was not in physics, but in representation.
+
+The fix:
+
+> establishes a smooth coordinate system in Hilbert space
+
+enabling stable and meaningful many-body analysis.
+
+---
+
+End of document.

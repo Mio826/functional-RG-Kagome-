@@ -1,6 +1,5 @@
-
 import numpy as np
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional, List, Tuple
 
 
@@ -27,8 +26,6 @@ class PatchSet:
     bz_vertices: np.ndarray
     b1: np.ndarray
     b2: np.ndarray
-    gauge_method: Optional[str] = None
-    gauge_loop_phase: float = 0.0
 
     @property
     def Npatch(self) -> int:
@@ -46,52 +43,6 @@ class PatchSet:
     def patch_weight(self) -> np.ndarray:
         return np.array([p.orbital_weight for p in self.patches])
 
-    @property
-    def patch_eigvec(self) -> np.ndarray:
-        return np.array([p.eigvec for p in self.patches])
-
-    def copy_with_eigvecs(
-        self,
-        eigvecs: np.ndarray,
-        *,
-        gauge_method: Optional[str] = None,
-        gauge_loop_phase: Optional[float] = None,
-    ) -> "PatchSet":
-        eigvecs = np.asarray(eigvecs, dtype=complex)
-        if eigvecs.shape != (self.Npatch, self.patch_eigvec.shape[1]):
-            raise ValueError(
-                f"eigvecs must have shape {(self.Npatch, self.patch_eigvec.shape[1])}, got {eigvecs.shape}"
-            )
-
-        new_patches = []
-        for p, u in zip(self.patches, eigvecs):
-            uu = np.asarray(u, dtype=complex)
-            nrm = np.linalg.norm(uu)
-            if nrm == 0:
-                raise ValueError("Encountered zero-norm eigvec in copy_with_eigvecs.")
-            uu = uu / nrm
-            new_patches.append(
-                replace(
-                    p,
-                    eigvec=uu,
-                    orbital_weight=np.abs(uu) ** 2 / np.sum(np.abs(uu) ** 2),
-                )
-            )
-
-        return PatchSet(
-            mu=self.mu,
-            mu_used_for_contour=self.mu_used_for_contour,
-            band_index=self.band_index,
-            filling=self.filling,
-            patches=new_patches,
-            fs_contour_k=self.fs_contour_k.copy(),
-            bz_vertices=self.bz_vertices.copy(),
-            b1=self.b1.copy(),
-            b2=self.b2.copy(),
-            gauge_method=self.gauge_method if gauge_method is None else gauge_method,
-            gauge_loop_phase=self.gauge_loop_phase if gauge_loop_phase is None else gauge_loop_phase,
-        )
-
 
 class FSPatcher:
     """
@@ -104,14 +55,6 @@ class FSPatcher:
     - If orbital_slice is not None:
         patch only that block, and band_index is the LOCAL band index
         inside the selected block.
-
-    Gauge convention
-    ----------------
-    Band eigenvectors are only defined up to a k-dependent U(1) phase.
-    For band-projected interactions this means raw patch-basis matrix
-    elements are gauge-covariant, not entrywise gauge-invariant.
-    To make patchwise quantities smoother and more interpretable, this
-    patcher can optionally enforce a contour-local gauge choice.
 
     Example for a 6x6 spin-conserving kagome model:
         orbital_slice = slice(0, 3)  -> first 3x3 block
@@ -135,9 +78,6 @@ class FSPatcher:
         contour_target_k: Optional[np.ndarray] = None,
         auto_level_shifts: Optional[List[float]] = None,
         prefer_closed_contour: bool = True,
-        gauge_fix: Optional[str] = "parallel_transport",
-        gauge_anchor: str = "max_component",
-        close_loop_gauge: bool = True,
         verbose: bool = False,
     ):
         self.model = model
@@ -151,9 +91,6 @@ class FSPatcher:
         self.contour_min_points = contour_min_points
         self.contour_target_k = None if contour_target_k is None else np.asarray(contour_target_k, dtype=float)
         self.prefer_closed_contour = prefer_closed_contour
-        self.gauge_fix = gauge_fix
-        self.gauge_anchor = gauge_anchor
-        self.close_loop_gauge = close_loop_gauge
         self.verbose = verbose
 
         if auto_level_shifts is None:
@@ -163,10 +100,6 @@ class FSPatcher:
 
         if (filling is None) == (mu is None):
             raise ValueError("Exactly one of filling or mu must be provided.")
-
-        valid_gauges = {None, "parallel_transport"}
-        if self.gauge_fix not in valid_gauges:
-            raise ValueError(f"Unsupported gauge_fix={self.gauge_fix!r}. Valid choices: {sorted(valid_gauges, key=str)}")
 
     # ------------------------
     # reciprocal helpers
@@ -282,81 +215,6 @@ class FSPatcher:
         if s > 0:
             w = w / s
         return w
-
-    # ------------------------
-    # gauge helpers
-    # ------------------------
-    @staticmethod
-    def _normalize_eigvec(u: np.ndarray) -> np.ndarray:
-        u = np.asarray(u, dtype=complex)
-        nrm = np.linalg.norm(u)
-        if nrm == 0:
-            raise ValueError("Encountered zero-norm eigenvector.")
-        return u / nrm
-
-    def _anchor_phase(self, u: np.ndarray) -> np.ndarray:
-        u = self._normalize_eigvec(u)
-        if self.gauge_anchor == "max_component":
-            idx = int(np.argmax(np.abs(u)))
-            if np.abs(u[idx]) > 0:
-                u = u * np.exp(-1j * np.angle(u[idx]))
-        elif self.gauge_anchor == "first_component":
-            if np.abs(u[0]) > 0:
-                u = u * np.exp(-1j * np.angle(u[0]))
-        else:
-            raise ValueError("gauge_anchor must be 'max_component' or 'first_component'.")
-        return u
-
-    def smooth_patch_eigvecs(self, eigvecs: np.ndarray) -> Tuple[np.ndarray, float]:
-        """
-        Parallel-transport gauge along the ordered FS contour.
-
-        Returns
-        -------
-        smoothed_eigvecs : ndarray, shape (Npatch, Norb_sector)
-        loop_phase : float
-            Net holonomy phase before optional loop-closure correction.
-        """
-        U = np.asarray(eigvecs, dtype=complex).copy()
-        if U.ndim != 2:
-            raise ValueError("eigvecs must be a 2D array of shape (Npatch, Norb).")
-        N = U.shape[0]
-        if N == 0:
-            return U, 0.0
-
-        U[0] = self._anchor_phase(U[0])
-
-        for p in range(1, N):
-            U[p] = self._normalize_eigvec(U[p])
-            ov = np.vdot(U[p - 1], U[p])
-            if np.abs(ov) > 1e-14:
-                U[p] *= np.exp(-1j * np.angle(ov))
-            else:
-                U[p] = self._anchor_phase(U[p])
-
-        loop_phase = 0.0
-        if N > 1:
-            ov_last = np.vdot(U[-1], U[0])
-            if np.abs(ov_last) > 1e-14:
-                loop_phase = float(np.angle(ov_last))
-
-        if self.close_loop_gauge and N > 1 and np.abs(loop_phase) > 1e-14:
-            # Distribute the residual holonomy smoothly around the loop while
-            # keeping patch 0 fixed.
-            for p in range(N):
-                U[p] *= np.exp(1j * (p / N) * loop_phase)
-
-            # Re-anchor patch 0 exactly, then restore continuity once.
-            U[0] = self._anchor_phase(U[0])
-            for p in range(1, N):
-                ov = np.vdot(U[p - 1], U[p])
-                if np.abs(ov) > 1e-14:
-                    U[p] *= np.exp(-1j * np.angle(ov))
-
-        for p in range(N):
-            U[p] = self._normalize_eigvec(U[p])
-
-        return U, loop_phase
 
     # ------------------------
     # refine point to exact FS
@@ -611,15 +469,13 @@ class FSPatcher:
         reps = self.resample_contour_by_arclength(main_contour, self.Npatch)
 
         patches = []
-        raw_eigvecs = []
         for pid, k0 in enumerate(reps):
             kf = self.project_to_fs(k0, mu)  # project back to the true mu, not shifted contour level
             uv = self.wrap_red(self.cart_to_red(kf))
             e = self.band_energy(kf[0], kf[1])
             vf = self.fermi_velocity(kf[0], kf[1])
             eig = self.band_eigvec(kf[0], kf[1])   # already sector-local if orbital_slice is set
-            eig = self._normalize_eigvec(eig)
-            raw_eigvecs.append(eig)
+            w = self.orbital_weight(eig)
 
             patches.append(
                 PatchPoint(
@@ -630,21 +486,9 @@ class FSPatcher:
                     vF=vf,
                     vF_norm=float(np.linalg.norm(vf)),
                     eigvec=eig,
-                    orbital_weight=self.orbital_weight(eig),
+                    orbital_weight=w,
                 )
             )
-
-        gauge_method = None
-        gauge_loop_phase = 0.0
-        if self.gauge_fix == "parallel_transport" and len(patches) > 0:
-            fixed, gauge_loop_phase = self.smooth_patch_eigvecs(np.array(raw_eigvecs, dtype=complex))
-            for pid, u in enumerate(fixed):
-                patches[pid] = replace(
-                    patches[pid],
-                    eigvec=u,
-                    orbital_weight=self.orbital_weight(u),
-                )
-            gauge_method = "parallel_transport"
 
         return PatchSet(
             mu=mu,
@@ -656,8 +500,6 @@ class FSPatcher:
             bz_vertices=verts,
             b1=self.b1,
             b2=self.b2,
-            gauge_method=gauge_method,
-            gauge_loop_phase=gauge_loop_phase,
         )
 
 
