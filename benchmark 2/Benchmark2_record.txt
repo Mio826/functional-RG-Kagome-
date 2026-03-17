@@ -1,0 +1,255 @@
+Benchmark 2 Record
+==================
+
+Scope
+-----
+Benchmark 2 validates the two new post-channel-analysis layers added after Benchmark 1:
+
+1. `form_factor.py`
+2. `kagome_order_diagnosis.py`
+
+These files are not replacements for the earlier modules. They sit on top of the existing
+pipeline:
+
+    noninteracting -> patching -> interaction -> channels -> form_factor -> kagome_order_diagnosis
+
+The purpose of Benchmark 2 is to check that, once a channel kernel is available, we can
+
+- extract the leading eigenspace robustly,
+- assign a coarse symmetry/family label in patch space,
+- reconstruct the leading mode into an internal-index tensor using patch Bloch eigenvectors,
+- diagnose Kagome-paper-style orders (FM, PI, cBO, sBO, f-SC),
+- and still leave an explicit `unclassified / novel_candidate` exit for future models.
+
+Files covered
+-------------
+1. `form_factor.py`
+2. `kagome_order_diagnosis.py`
+
+Design intent of the two files
+------------------------------
+
+A. `form_factor.py`
+~~~~~~~~~~~~~~~~~~~
+Role:
+- Read a `ChannelKernel`.
+- Diagonalize the kernel and identify the leading eigenspace.
+- Group nearly degenerate leading eigenvalues into one subspace.
+- Project that eigenspace onto a small generic template library.
+
+This layer is intentionally generic and model-agnostic.
+
+Main mathematical object:
+- For a given channel kernel K, solve
+
+      sum_{p'} K_{p,p'} phi(p') = lambda phi(p)
+
+- The leading eigenvector / eigenspace is interpreted as the dominant patch-space collective mode.
+
+What it returns:
+- leading eigenspace dimension,
+- coarse label such as `s`, `d`, `f`, `finiteQ_cos_sin`, `pp_odd`, etc.,
+- simple sublattice-weight summary from patch Bloch eigenvectors,
+- parity proxy for pp kernels from partner-patch comparison,
+- diagnostic notes.
+
+Important limitation:
+- This layer works in patch space.
+- It is sufficient for coarse symmetry analysis, but it does not yet reconstruct the
+  full multisublattice order parameter used in the Kagome PRL.
+
+B. `kagome_order_diagnosis.py`
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Role:
+- Take the leading mode returned by the coarse recognizer.
+- Reconstruct it into an internal-index tensor using patch Bloch eigenvectors.
+- Compare the reconstructed tensor against Kagome-paper-specific templates.
+- Return a paper-style label if the match is strong enough.
+- Otherwise return `unclassified` and mark it as a possible novel candidate.
+
+Main reconstruction formulas:
+- particle-hole channel:
+
+      Phi_{l n}(p;Q) ~ g(p) * u_l^*(k_p) * u_n(k_{p_Q})
+
+- particle-particle channel:
+
+      Delta_{m n}(p) ~ g(p) * u_m(k_p) * u_n(k_{p_partner})
+
+where
+- g(p) is the leading patch-space mode,
+- u(k) is the Bloch eigenvector stored in the patch set.
+
+This layer therefore translates
+- "where in momentum space the mode is strong"
+into
+- "which sublattice pairs carry the order".
+
+Returned internal summaries include:
+- reconstructed tensor basis,
+- pair-weight matrix,
+- dominant sublattice pair,
+- same-sublattice weight,
+- inter-sublattice weight,
+- paper label,
+- recognition status (`recognized` or `novel_candidate`).
+
+Benchmark notebooks and evolution
+---------------------------------
+Benchmark 2 was developed in stages.
+
+1. `benchmark2_order_recognition.ipynb`
+   - unit tests for the coarse recognizer only.
+
+2. `benchmark2_kagome_order_diagnosis.ipynb`
+   - first paper-diagnosis attempt.
+   - result: PI and FM could be recognized, but cBO / sBO / f-SC were not yet robustly
+     recognized.
+   - this exposed that patch-space scalar harmonics alone were not enough for the
+     multisublattice Kagome orders.
+
+3. `benchmark2_internal_mode_reconstruction.ipynb`
+   - upgraded benchmark for the current design.
+   - this notebook tests the explicit internal tensor reconstruction and the updated
+     diagnosis logic.
+   - this is the benchmark that should be regarded as the successful final Benchmark 2.
+
+What was tested in the final Benchmark 2
+----------------------------------------
+The final notebook tests six synthetic cases. These are controlled unit-test modes rather than
+full FRG outputs. The goal is to validate the logic of the reconstruction/diagnosis layer before
+feeding it real RG data.
+
+Case 1: PI
+~~~~~~~~~~
+Construction:
+- channel: `ph_charge`
+- Q = 0
+- patch-space mode: d-wave doublet
+- patch Bloch eigenvectors chosen so that the signal is diagonal / same-sublattice
+
+Expected behavior:
+- recognized as `PI`
+- dominant pair = (A, A)
+- same-sublattice weight dominant
+
+Case 2: cBO
+~~~~~~~~~~~
+Construction:
+- channel: finite-Q particle-hole charge sector
+- one-Q bond-order-like patch mode
+- patch Bloch structure chosen to emphasize an off-diagonal B-C bond component
+
+Expected behavior:
+- recognized as `cBO`
+- dominant pair = (B, C)
+- inter-sublattice weight dominant
+
+Case 3: sBO
+~~~~~~~~~~~
+Construction:
+- same spatial structure as cBO
+- spin-like particle-hole channel
+
+Expected behavior:
+- recognized as `sBO`
+- dominant pair = (B, C)
+- inter-sublattice weight dominant
+
+Case 4: f-SC
+~~~~~~~~~~~~
+Construction:
+- pp triplet / odd sector
+- patch Bloch structure chosen to emphasize A-B inter-sublattice pairing
+
+Expected behavior:
+- recognized as `f-SC`
+- dominant pair = (A, B)
+- inter-sublattice weight dominant
+
+Case 5: FM
+~~~~~~~~~~
+Construction:
+- Q = 0
+- spin-like particle-hole constant mode
+- diagonal / same-sublattice signal
+
+Expected behavior:
+- recognized as `FM`
+
+Case 6: novel_pp_dwave
+~~~~~~~~~~~~~~~~~~~~~~
+Construction:
+- pp singlet d-wave-like mode
+- physically reasonable but intentionally outside the five Kagome PRL labels
+
+Expected behavior:
+- should NOT be forced into FM / PI / cBO / sBO / f-SC
+- should return `paper_label = "unclassified"`
+- should return `recognition_status = "novel_candidate"`
+
+Final observed outcome
+----------------------
+From the successful final Benchmark 2 run (`benchmark2_internal_mode_reconstruction.ipynb`),
+the six cases behaved as intended:
+
+- PI -> `PI` / `recognized`
+- cBO -> `cBO` / `recognized`
+- sBO -> `sBO` / `recognized`
+- fSC -> `f-SC` / `recognized`
+- FM -> `FM` / `recognized`
+- novel_pp_dwave -> `unclassified` / `novel_candidate`
+
+The notebook assertions all passed.
+
+What this shows architecturally
+-------------------------------
+1. The earlier modules from Benchmark 1 do NOT need to be rewritten.
+   The current outputs of
+   - patching
+   - interaction
+   - channels
+   are sufficient to support the new post-processing layer.
+
+2. `form_factor.py` remains necessary.
+   It provides the leading eigenspace, coarse symmetry family, degeneracy handling,
+   and partner-parity information.
+   This is the correct generic layer between `channels.py` and any model-specific diagnosis.
+
+3. `kagome_order_diagnosis.py` is a second, more specific layer.
+   It reconstructs the leading patch mode into an internal Kagome tensor and assigns
+   a paper-style physical label only if the evidence is strong enough.
+
+4. The new design explicitly leaves room for future models.
+   The `unclassified / novel_candidate` output is not a failure mode.
+   It is an intentional safety feature that prevents new physics from being forced into
+   the five labels of the 2013 Kagome PRL.
+
+Current limitations
+-------------------
+Benchmark 2 validates the logic of the diagnosis layer, but not the full FRG physics yet.
+
+In particular:
+- The benchmark uses synthetic kernels / synthetic patch modes, not temperature-flow-renormalized
+  FRG vertices.
+- cBO/sBO are currently diagnosed as one-Q components; the full three-Q superposition and 12-site
+  real-space pattern are a later layer.
+- Real-space bond-distance identification (e.g. explicit second-neighbor vs third-neighbor
+  reconstruction from real FRG output) is not yet part of the current benchmark.
+
+Practical conclusion
+--------------------
+Benchmark 2 is successful.
+
+It shows that the project now has a complete post-channel-analysis chain:
+
+    Channel kernel
+        -> coarse eigenspace / form-factor analysis
+        -> internal mode reconstruction
+        -> Kagome order diagnosis
+        -> optional novel-candidate exit
+
+This means the codebase is ready for the next stage:
+- integrating temperature-cutoff RG flow,
+- generating renormalized kernels from the actual FRG solver,
+- and then feeding those kernels into the already-benchmarked diagnosis stack.
