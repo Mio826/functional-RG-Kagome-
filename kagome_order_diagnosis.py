@@ -1,8 +1,7 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -10,6 +9,8 @@ try:
     from form_factor import ModeAnalysis, OrderRecognizer, _extract_patch_eigvecs, _extract_patch_positions
 except Exception:
     from order_recognition import ModeAnalysis, OrderRecognizer, _extract_patch_eigvecs, _extract_patch_positions
+
+SpinLike = Union[str, int]
 
 
 @dataclass
@@ -27,9 +28,13 @@ class InternalModeTensors:
     tensor_basis has shape (Npatch, Norb, Norb, dim)
       - ph channel: Phi_{l n}(p;Q)
       - pp channel: Delta_{m n}(p)
+
+    leg_spin_structure records which physical spin sectors were used to build the
+    tensor. This is the real fix compared with the old file.
     """
     channel_sector: str
     spin_sector: str
+    leg_spin_structure: Tuple[str, str]
     tensor_basis: np.ndarray
     pair_weights: np.ndarray
     dominant_pair: Optional[Tuple[int, int]]
@@ -40,6 +45,7 @@ class InternalModeTensors:
         return {
             "channel_sector": self.channel_sector,
             "spin_sector": self.spin_sector,
+            "leg_spin_structure": tuple(self.leg_spin_structure),
             "tensor_basis_shape": tuple(int(x) for x in self.tensor_basis.shape),
             "dominant_pair": None if self.dominant_pair is None else tuple(int(x) for x in self.dominant_pair),
             "same_sublattice_weight": float(self.same_sublattice_weight),
@@ -61,6 +67,7 @@ class KagomeOrderDiagnosis:
     top_template_score: float
     spin_sector: str
     channel_sector: str
+    leg_spin_structure: Tuple[str, str]
     degeneracy: int
     internal_mode: InternalModeTensors
     template_scores: List[PaperTemplateScore]
@@ -79,6 +86,7 @@ class KagomeOrderDiagnosis:
             "top_template_score": float(self.top_template_score),
             "spin_sector": str(self.spin_sector),
             "channel_sector": str(self.channel_sector),
+            "leg_spin_structure": tuple(self.leg_spin_structure),
             "degeneracy": int(self.degeneracy),
             "internal_mode": self.internal_mode.summary_dict(),
             "template_scores": [{"name": t.name, "score": float(t.score), **t.details} for t in self.template_scores],
@@ -88,43 +96,110 @@ class KagomeOrderDiagnosis:
 
 class KagomeOrderDiagnoser:
     """
-    Paper-oriented Kagome diagnosis layer.
+    Spin-aware Kagome diagnosis layer.
 
-    Role of form_factor.py
-    ----------------------
-    This class still *depends* on the coarse recognizer from form_factor.py
-    (or order_recognition.py as a fallback). That earlier layer remains useful:
-      1) it finds the leading eigenspace / degeneracy robustly,
-      2) it gives generic symmetry labels (s, d, f, finite-Q ph, ...)
-      3) it should remain model-agnostic.
+    Why this file must change
+    -------------------------
+    The old version accepted only one patchset and therefore only one Bloch basis.
+    That is fine only when up/down are exactly degenerate. Once the model preserves
+    S_z but has different up/down Bloch eigenvectors, reconstructing pp/ph tensors
+    from a single `self.eigvecs` becomes wrong.
 
-    This file adds the next layer:
-      - reconstruct the leading mode into internal-index tensors
-            ph : Phi_{l n}(p;Q)
-            pp : Delta_{m n}(p)
-      - compare with Kagome-paper-specific templates
-      - still keep an open 'unclassified / novel_candidate' exit
+    This version supports
+      - a single patchset            : backward compatible
+      - patchsets_by_spin={up, dn}   : correct for spin-dependent Bloch bases
     """
 
     def __init__(
         self,
-        patchset: Any,
+        patchset: Any = None,
         *,
+        patchsets_by_spin: Optional[Mapping[SpinLike, Any]] = None,
         recognizer: Optional[OrderRecognizer] = None,
+        default_spin: str = "up",
         q_zero_tol: float = 1e-8,
         min_paper_template_score: float = 0.12,
     ):
-        self.patchset = patchset
-        self.ks = _extract_patch_positions(patchset)
-        self.eigvecs = _extract_patch_eigvecs(patchset)
-        if self.eigvecs.ndim != 2:
-            raise ValueError("Patch eigvec array must have shape (Npatch, Norb).")
+        if patchsets_by_spin is None:
+            if patchset is None:
+                raise ValueError("Provide either patchset or patchsets_by_spin.")
+            patchsets_by_spin = {default_spin: patchset}
+        elif patchset is not None:
+            raise ValueError("Provide patchset or patchsets_by_spin, not both.")
+
+        self.patchsets_by_spin: Dict[str, Any] = {
+            self._normalize_spin(k): v for k, v in patchsets_by_spin.items()
+        }
+        if len(self.patchsets_by_spin) == 0:
+            raise ValueError("patchsets_by_spin is empty.")
+
+        self.default_spin = self._normalize_spin(default_spin)
+        if self.default_spin not in self.patchsets_by_spin:
+            self.default_spin = next(iter(self.patchsets_by_spin.keys()))
+
+        self.patchset = self.patchsets_by_spin[self.default_spin]
+        self.ks = _extract_patch_positions(self.patchset)
+        self.eigvecs_by_spin: Dict[str, np.ndarray] = {}
+        self._validate_patchsets()
+        self.eigvecs = self.eigvecs_by_spin[self.default_spin]
+
         self.Npatch = int(self.ks.shape[0])
         self.Norb = int(self.eigvecs.shape[1]) if self.eigvecs.size else 0
-        self.recognizer = recognizer if recognizer is not None else OrderRecognizer(patchset)
+        self.recognizer = recognizer if recognizer is not None else OrderRecognizer(
+            patchsets_by_spin=self.patchsets_by_spin,
+            default_spin=self.default_spin,
+        )
         self.q_zero_tol = float(q_zero_tol)
         self.min_paper_template_score = float(min_paper_template_score)
         self._pair_labels = {0: "A", 1: "B", 2: "C"}
+
+    def _normalize_spin(self, spin: SpinLike) -> str:
+        s = str(spin).lower()
+        aliases = {
+            "up": "up",
+            "u": "up",
+            "0": "up",
+            "dn": "dn",
+            "down": "dn",
+            "d": "dn",
+            "1": "dn",
+            "s": "S",
+            "t": "T",
+            "rho": "rho",
+            "sz": "sz",
+        }
+        return aliases.get(s, str(spin))
+
+    def _validate_patchsets(self) -> None:
+        ref_ks = None
+        ref_npatch = None
+        ref_norb = None
+        for spin, ps in self.patchsets_by_spin.items():
+            ks = _extract_patch_positions(ps)
+            eig = _extract_patch_eigvecs(ps)
+            self.eigvecs_by_spin[spin] = eig
+            if ref_ks is None:
+                ref_ks = ks
+                ref_npatch = ks.shape[0]
+                ref_norb = eig.shape[1] if eig.ndim == 2 else None
+            else:
+                if ks.shape[0] != ref_npatch:
+                    raise ValueError("All spin patchsets used by KagomeOrderDiagnoser must have the same Npatch.")
+                if not np.allclose(ks, ref_ks, atol=1e-10, rtol=0.0):
+                    raise ValueError(
+                        "KagomeOrderDiagnoser assumes up/down patch coordinates are the same. "
+                        "Different Bloch eigenvectors are allowed; different patch locations are not."
+                    )
+                if eig.ndim == 2 and ref_norb is not None and eig.shape[1] != ref_norb:
+                    raise ValueError("All spin patchsets must have the same Norb for the order-diagnosis layer.")
+
+    def _eigvecs_for_spin(self, spin: SpinLike) -> np.ndarray:
+        key = self._normalize_spin(spin)
+        if key in self.eigvecs_by_spin:
+            return self.eigvecs_by_spin[key]
+        if key in {"S", "T", "rho", "sz"} and "up" in self.eigvecs_by_spin:
+            return self.eigvecs_by_spin["up"]
+        return self.eigvecs_by_spin[self.default_spin]
 
     # ---------- generic helpers ----------
     def _channel_sector(self, kernel_name: str) -> str:
@@ -137,6 +212,41 @@ class KagomeOrderDiagnoser:
         if "singlet" in name or "charge" in name:
             return "charge/singlet"
         return "unknown"
+
+    def _infer_leg_spin_structure(self, kernel: Any) -> Tuple[str, str]:
+        """
+        Return the *physical* spin sectors used to reconstruct the two legs.
+
+        Why not just trust kernel.row_spins / col_spins blindly?
+        Because channels.py intentionally labels some combined kernels as
+        ('S','S') or ('rho','rho'). Those are useful semantic tags, but they do
+        not tell us which Bloch basis to use. For reconstruction we need the
+        actual physical sectors.
+        """
+        name = getattr(kernel, "name", "").lower()
+
+        if name in {"pp_singlet_sz0", "pp_triplet_sz0"}:
+            return ("up", "dn")
+        if name == "ph_charge_longitudinal" or name == "ph_spin_longitudinal":
+            return ("up", "dn")
+        if name == "pp" and hasattr(kernel, "col_spins"):
+            s1, s2 = kernel.col_spins
+            s1 = self._normalize_spin(s1)
+            s2 = self._normalize_spin(s2)
+            if s1 in {"up", "dn"} and s2 in {"up", "dn"}:
+                return (s1, s2)
+        if name.startswith("ph") and hasattr(kernel, "col_spins"):
+            s1, s2 = kernel.col_spins
+            s1 = self._normalize_spin(s1)
+            s2 = self._normalize_spin(s2)
+            if s1 in {"up", "dn"} and s2 in {"up", "dn"}:
+                return (s1, s2)
+
+        if "uu" in name:
+            return ("up", "up")
+        if "dd" in name or "dn" in name:
+            return ("dn", "dn")
+        return (self.default_spin, self.default_spin)
 
     def _orthonormalize(self, mat: np.ndarray, tol: float = 1e-12) -> np.ndarray:
         mat = np.asarray(mat, dtype=complex)
@@ -157,7 +267,7 @@ class KagomeOrderDiagnoser:
     def _pair_weight_summary(self, tensor_basis: np.ndarray) -> Tuple[np.ndarray, Optional[Tuple[int, int]], float, float]:
         if tensor_basis.ndim != 4:
             raise ValueError("tensor_basis must have shape (Npatch, Norb, Norb, dim).")
-        weights = np.sum(np.abs(tensor_basis) ** 2, axis=(0, 3))  # (Norb, Norb)
+        weights = np.sum(np.abs(tensor_basis) ** 2, axis=(0, 3))
         total = float(np.sum(weights))
         if total > 0:
             weights = weights / total
@@ -170,15 +280,6 @@ class KagomeOrderDiagnoser:
 
     # ---------- internal-index reconstruction ----------
     def reconstruct_mode_tensor(self, kernel: Any, mode: ModeAnalysis) -> InternalModeTensors:
-        """
-        Reconstruct the leading mode into tensors with explicit orbital/sublattice indices.
-
-        ph  : Phi_{l n}(p;Q) ~ g(p) * u_l^*(p) * u_n(p_Q)
-        pp  : Delta_{m n}(p) ~ g(p) * [u_m(p) u_n(p_partner) +/- u_n(p) u_m(p_partner)] / 2
-
-        This uses the *column* patch basis convention to stay consistent with the
-        channel-kernel definitions in channels.py.
-        """
         basis = np.asarray(mode.basis_vectors, dtype=complex)
         partner = np.asarray(kernel.col_partner_patches, dtype=int)
         if partner.shape[0] != self.Npatch:
@@ -189,25 +290,43 @@ class KagomeOrderDiagnoser:
         out = np.zeros((self.Npatch, self.Norb, self.Norb, basis.shape[1]), dtype=complex)
         channel = self._channel_sector(kernel.name)
         spin_sector = self._spin_sector(kernel.name)
-        is_triplet = ("triplet" in kernel.name.lower()) or ("spin" in kernel.name.lower())
+        leg_spins = self._infer_leg_spin_structure(kernel)
+        name = kernel.name.lower()
 
         for a in range(basis.shape[1]):
             g = basis[:, a]
             for p in range(self.Npatch):
-                u = np.asarray(self.eigvecs[p], dtype=complex)
-                v = np.asarray(self.eigvecs[partner[p]], dtype=complex)
+                if name in {"ph_charge_longitudinal", "ph_spin_longitudinal"}:
+                    u_up = np.asarray(self._eigvecs_for_spin("up")[p], dtype=complex)
+                    v_up = np.asarray(self._eigvecs_for_spin("up")[partner[p]], dtype=complex)
+                    u_dn = np.asarray(self._eigvecs_for_spin("dn")[p], dtype=complex)
+                    v_dn = np.asarray(self._eigvecs_for_spin("dn")[partner[p]], dtype=complex)
+                    sign = +1.0 if name == "ph_charge_longitudinal" else -1.0
+                    out[p, :, :, a] = 0.5 * g[p] * (
+                        np.outer(np.conjugate(u_up), v_up) + sign * np.outer(np.conjugate(u_dn), v_dn)
+                    )
+                    continue
+
+                left_spin, right_spin = leg_spins
+                u = np.asarray(self._eigvecs_for_spin(left_spin)[p], dtype=complex)
+                v = np.asarray(self._eigvecs_for_spin(right_spin)[partner[p]], dtype=complex)
+
                 if channel == "ph":
                     out[p, :, :, a] = g[p] * np.outer(np.conjugate(u), v)
                 else:
+                    if name in {"pp_singlet_sz0", "pp_triplet_sz0"}:
+                        sign = -1.0 if name == "pp_singlet_sz0" else +1.0
+                    else:
+                        sign = +1.0 if ("triplet" in name or "spin" in name) else -1.0
                     outer_uv = np.outer(u, v)
                     outer_vu = np.outer(v, u)
-                    sign = +1.0 if is_triplet else -1.0
                     out[p, :, :, a] = 0.5 * g[p] * (outer_uv + sign * outer_vu)
 
         pair_weights, dominant_pair, same_w, inter_w = self._pair_weight_summary(out)
         return InternalModeTensors(
             channel_sector=channel,
             spin_sector=spin_sector,
+            leg_spin_structure=leg_spins,
             tensor_basis=out,
             pair_weights=pair_weights,
             dominant_pair=dominant_pair,
@@ -223,7 +342,6 @@ class KagomeOrderDiagnoser:
         z = np.zeros((self.Npatch, self.Norb, self.Norb), dtype=complex)
         templates: Dict[str, np.ndarray] = {}
 
-        # PI templates: diagonal / same-sublattice, Eq. (3) of the paper.
         f_dx2y2 = np.cos(2 * kx) - np.cos(kx) * np.cos(np.sqrt(3.0) * ky)
         f_dxy = np.sqrt(3.0) * np.sin(kx) * np.sin(np.sqrt(3.0) * ky)
         for name, f in [("PI_dx2y2", f_dx2y2), ("PI_dxy", f_dxy)]:
@@ -232,7 +350,6 @@ class KagomeOrderDiagnoser:
                 t[:, m, m] = f
             templates[name] = t
 
-        # f-SC templates: Eq. (5) in the paper.
         f_ab = np.sin(1.5 * kx + 0.5 * np.sqrt(3.0) * ky)
         f_bc = np.sin(1.5 * kx - 0.5 * np.sqrt(3.0) * ky)
         f_ac = np.sin(np.sqrt(3.0) * ky)
@@ -248,7 +365,6 @@ class KagomeOrderDiagnoser:
                 t[:, j, i] = f
             templates[name] = t
 
-        # finite-Q BO templates: one-Q components only. Full three-Q superposition is a later layer.
         qnorm = float(np.linalg.norm(Q))
         if qnorm > self.q_zero_tol:
             phase = self.ks @ Q
@@ -267,7 +383,6 @@ class KagomeOrderDiagnoser:
                 t[:, j, i] = f_q
             templates["BO_finiteQ"] = t
 
-        # FM template: Q=0 diagonal constant spin-like ph order.
         t = np.zeros_like(z)
         for m in range(min(self.Norb, 3)):
             t[:, m, m] = 1.0
@@ -362,11 +477,10 @@ class KagomeOrderDiagnoser:
             if ("triplet" in name or (mode.partner_parity is not None and mode.partner_parity < 0.0)) and fscore > self.min_paper_template_score:
                 notes.append("Odd / triplet-like pp mode with strong f-wave kagome pair template overlap.")
                 return "f-SC", fscore, "recognized", notes
-            if mode.partner_parity is not None:
-                return self._build_unclassified(
-                    mode, top,
-                    reason="Superconducting pp mode detected, but it does not match the kagome f-SC templates strongly enough."
-                )
+            return self._build_unclassified(
+                mode, top,
+                reason="Superconducting pp mode detected, but it does not match the kagome f-SC templates strongly enough."
+            )
 
         return self._build_unclassified(
             mode,
@@ -408,6 +522,7 @@ class KagomeOrderDiagnoser:
             top_template_score=float(top_template.score),
             spin_sector=self._spin_sector(kernel.name),
             channel_sector=self._channel_sector(kernel.name),
+            leg_spin_structure=internal_mode.leg_spin_structure,
             degeneracy=int(mode.subspace_dim),
             internal_mode=internal_mode,
             template_scores=template_scores,

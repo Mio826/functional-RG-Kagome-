@@ -253,3 +253,183 @@ This means the codebase is ready for the next stage:
 - integrating temperature-cutoff RG flow,
 - generating renormalized kernels from the actual FRG solver,
 - and then feeding those kernels into the already-benchmarked diagnosis stack.
+
+
+Benchmark 2 Spin-Aware Addendum
+===============================
+
+Scope of this addendum
+----------------------
+This addendum records the follow-up benchmark performed after upgrading
+`form_factor.py` and `kagome_order_diagnosis.py` from a single-patchset design
+to a spin-aware design.
+
+Why the upgrade was needed
+--------------------------
+The original Benchmark 2 logic assumed that one patch set was enough for all
+reconstruction steps. That assumption is acceptable only when
+
+- the model is spin-degenerate, or
+- the analysis is restricted to a single spin block whose Bloch eigenvectors are
+  the same objects used everywhere.
+
+For the present project this is too restrictive. The intended models generally
+preserve S_z, so spin blocks do not mix, but the up-spin and down-spin sectors
+may nevertheless have different Bloch eigenvectors and even different patch
+representatives. In that situation, the old Benchmark 2 code could still attach
+labels such as `charge`, `spin`, `singlet`, or `triplet` from the kernel name,
+but its internal tensor reconstruction still used only one patch Bloch basis.
+That was the logical weakness that had to be fixed.
+
+What was changed
+----------------
+1. `form_factor.py`
+   - upgraded to accept `patchsets_by_spin={"up": ..., "dn": ...}` while
+     retaining backward compatibility with the old single-patchset usage.
+   - the recognizer still remains the generic, patch-space layer.
+   - it now has access to spin-resolved patch Bloch data when needed.
+
+2. `kagome_order_diagnosis.py`
+   - upgraded to accept the same `patchsets_by_spin` structure.
+   - internal tensor reconstruction is no longer forced to use one universal
+     `eigvecs` array.
+   - the code now routes the two legs of the reconstructed mode to the proper
+     spin-resolved Bloch bases, e.g.
+         up-up,
+         dn-dn,
+         up-dn.
+   - the diagnosis output now explicitly records `leg_spin_structure`.
+
+Architectural meaning of the new Benchmark 2
+--------------------------------------------
+With this upgrade, the post-channel-analysis stack becomes
+
+    channels
+        -> form_factor (generic leading-mode recognition)
+        -> kagome_order_diagnosis (spin-aware internal reconstruction)
+        -> paper-style order label or novel-candidate exit
+
+The spin organization is therefore now split cleanly across layers:
+
+- `channels.py`
+  still builds the relevant spin blocks (`uu`, `dd`, `ud`, `du`) and combines
+  them into physical kernels such as longitudinal charge/spin or
+  singlet/triplet S_z=0.
+
+- `form_factor.py`
+  reads a single already-built channel kernel and determines its dominant
+  patch-space eigenspace / symmetry family.
+
+- `kagome_order_diagnosis.py`
+  takes that leading patch mode and reconstructs the internal-index tensor using
+  the correct spin-resolved Bloch eigenvectors for the two legs.
+
+This is the correct division of responsibilities.
+
+What the spin-aware notebook tested
+-----------------------------------
+The new notebook `benchmark2_spinaware_test.ipynb` was not designed as a full
+FRG-physics test. It was designed as a logic test for spin routing.
+
+Synthetic patch sets were constructed for two spin sectors:
+
+- one `patchset_up`
+- one `patchset_dn`
+
+with deliberately different Bloch eigenvectors. This is important: if the two
+spin sectors had identical eigvecs, the old and new reconstruction logic could
+appear to agree by accident.
+
+Synthetic kernels were then used to test several representative sectors:
+
+1. `pp_singlet_sz0`
+   - expected to use the pair of spin bases (`up`, `dn`)
+
+2. `ph_charge_longitudinal`
+   - built from longitudinal particle-hole information
+   - expected to route through spin-resolved reconstruction rather than one
+     universal basis
+
+3. `ph_spin_longitudinal`
+   - same comment as above, but in the spin-like longitudinal sector
+
+4. `triplet_uu`
+   - expected to remain a same-spin reconstruction using (`up`, `up`)
+
+Observed notebook output
+------------------------
+The notebook printed the following key structural outcomes:
+
+- `pp_singlet_sz0`
+  -> leg spin structure = (`up`, `dn`)
+  -> dominant pair = (1, 2)
+  -> same/inter weight = 0.0 / 1.0
+
+- `ph_charge_longitudinal`
+  -> leg spin structure = (`up`, `dn`)
+  -> dominant pair = (1, 0)
+  -> inter-sublattice weight strongly dominant
+
+- `ph_spin_longitudinal`
+  -> leg spin structure = (`up`, `dn`)
+  -> dominant pair = (1, 0)
+  -> inter-sublattice weight strongly dominant
+
+- `triplet_uu`
+  -> leg spin structure = (`up`, `up`)
+  -> dominant pair = (0, 2)
+  -> same/inter weight = 0.0 / 1.0
+
+The notebook also contained explicit assertions checking that
+
+- charge leg spins were reported as (`up`, `dn`)
+- spin leg spins were reported as (`up`, `dn`)
+- singlet leg spins were reported as (`up`, `dn`)
+
+and these routing assertions passed.
+
+Most importantly, the notebook compared the reconstructed internal tensors of
+
+- `ph_charge_longitudinal`
+- `ph_spin_longitudinal`
+
+and found a nonzero difference
+
+    ||charge tensor - spin tensor|| = 1.0
+
+This is exactly the sanity check we wanted. It shows that once up/down Bloch
+eigenvectors differ, the spin-aware reconstruction really distinguishes the two
+longitudinal sectors at the internal-tensor level. In other words, the new code
+is not merely relabeling modes; it is actually using the spin-resolved Bloch
+bases in the reconstruction.
+
+Interpretation of the benchmark result
+--------------------------------------
+This new benchmark should be regarded as successful.
+
+It does NOT prove that the full FRG physics is complete. It proves something
+more specific and currently more urgent:
+
+- the Benchmark 2 diagnosis layer now uses the correct spin-resolved patch
+  basis,
+- the old single-patchset logical weakness has been removed,
+- and the code is now consistent with models that preserve S_z but have
+  nonidentical up/down band eigenvectors.
+
+Practical conclusion
+--------------------
+After this addendum, Benchmark 2 supports the intended use case of the project:
+
+- spin blocks may remain separate,
+- up/down sectors may differ,
+- channel kernels still come from `channels.py`,
+- and the post-processing stack can now reconstruct and diagnose leading modes
+  without silently collapsing both spin sectors onto one shared Bloch basis.
+
+Remaining limitation
+--------------------
+This benchmark still uses synthetic kernels and synthetic patch Bloch data.
+It validates the logic of spin-aware reconstruction, not yet the full
+temperature-flow FRG output on a physical kagome model. That full integration
+belongs to the next stage of the project.
+
