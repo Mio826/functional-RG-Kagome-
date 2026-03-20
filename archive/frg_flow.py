@@ -1,4 +1,3 @@
-# frg_flow.py
 
 from __future__ import annotations
 
@@ -107,6 +106,7 @@ class BareVertexFromInteraction:
     def __init__(self, interaction: Any, patchsets: PatchSetMap):
         self.interaction = interaction
         self.patchsets = patchsets
+        
 
     def __call__(self, p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
         return complex(
@@ -251,8 +251,6 @@ class FRGFlowSolver:
       pp  : matrix[p3, p1]
       phd : matrix[p4, p1]
       phc : matrix[p2, p1]
-
-    These are exactly the routing conventions already fixed in channels.py.
     """
 
     def __init__(
@@ -283,7 +281,9 @@ class FRGFlowSolver:
         self.patchsets = patchsets
         self.bare_gamma = bare_gamma
         self.spin_blocks = [canonical_spin_tuple(x) for x in (spin_blocks or default_spin_blocks(patchsets))]
-
+        self.allowed_spin_blocks = frozenset(self.spin_blocks)
+        self.bare_vertex_norm = self._estimate_bare_vertex_norm()
+        
         if pp_Qs is None:
             pp_Qs = build_unique_q_list(patchsets, mode="pp")
         if ph_Qs is None:
@@ -342,10 +342,6 @@ class FRGFlowSolver:
         self.history: List[FlowStepRecord] = []
         self.instability_record: Optional[FlowStepRecord] = None
 
-    # ------------------------------
-    # state helpers
-    # ------------------------------
-
     def _empty_channel_store(self, grid: TransferGrid) -> Dict[ChannelKey, np.ndarray]:
         ref_spin = available_physical_spins(self.patchsets)[0]
         Np = patchset_for_spin(self.patchsets, ref_spin).Npatch
@@ -367,10 +363,33 @@ class FRGFlowSolver:
             return np.geomspace(self.T_start, self.T_stop, self.n_steps)
         return np.linspace(self.T_start, self.T_stop, self.n_steps)
 
-    # ------------------------------
-    # Gamma reconstruction
-    # ------------------------------
-
+    def _channel_elem(self, store: Dict[ChannelKey, np.ndarray], key: ChannelKey, i: int, j: int) -> complex:
+        mat = store.get(key)
+        if mat is None:
+            return 0.0 + 0.0j
+        return complex(mat[i, j])
+        
+    def _estimate_bare_vertex_norm(self, sample_cap: int = 6) -> float:
+        """
+        Estimate a typical scale of the bare vertex for adaptive step control.
+        We only need an order-of-magnitude stable normalization, not an exact extremum.
+        """
+        ref_spin = list(self.patchsets.keys())[0]
+        Np = self.patchsets[ref_spin].Npatch
+        P = min(sample_cap, Np)
+    
+        vals = []
+        for (s1, s2, s3, s4) in self.spin_blocks:
+            for p1 in range(P):
+                for p2 in range(P):
+                    for p3 in range(P):
+                        p4 = 0
+                        vals.append(abs(self.bare_gamma(p1, s1, p2, s2, p3, s3, p4, s4)))
+    
+        if not vals:
+            return 1e-14
+        return max(float(np.max(vals)), 1e-14)
+    
     def gamma_accessor(self) -> GammaAccessor:
         state = self.state
 
@@ -382,25 +401,18 @@ class FRGFlowSolver:
 
             val = complex(state.bare_gamma(p1, s1n, p2, s2n, p3, s3n, p4, s4n))
 
-            # pp contribution: Q = k1 + k2, matrix[p3, p1]
             iq_pp = state.pp_grid.nearest_index(k1 + k2)
-            val += state.pp_corr.get((s1n, s2n, s3n, s4n, iq_pp), 0.0)[p3, p1]
+            val += self._channel_elem(state.pp_corr, (s1n, s2n, s3n, s4n, iq_pp), p3, p1)
 
-            # ph direct contribution: Q = k3 - k1, matrix[p4, p1]
             iq_phd = state.phd_grid.nearest_index(k3 - k1)
-            val += state.phd_corr.get((s1n, s2n, s3n, s4n, iq_phd), 0.0)[p4, p1]
+            val += self._channel_elem(state.phd_corr, (s1n, s2n, s3n, s4n, iq_phd), p4, p1)
 
-            # ph crossed contribution: Q = k3 - k2, matrix[p2, p1]
             iq_phc = state.phc_grid.nearest_index(k3 - k2)
-            val += state.phc_corr.get((s1n, s2n, s3n, s4n, iq_phc), 0.0)[p2, p1]
+            val += self._channel_elem(state.phc_corr, (s1n, s2n, s3n, s4n, iq_phc), p2, p1)
 
             return complex(val)
 
         return gamma
-
-    # ------------------------------
-    # RHS assembly in channel storage
-    # ------------------------------
 
     def _rhs_norm(self, rhs_pp, rhs_phd, rhs_phc) -> float:
         vals: List[float] = []
@@ -418,54 +430,44 @@ class FRGFlowSolver:
 
         for iq, Q in enumerate(self.pp_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                try:
-                    ker = compute_pp_kernel(
-                        gamma,
-                        self.patchsets,
-                        Q,
-                        incoming_spins=(s1, s2),
-                        outgoing_spins=(s3, s4),
-                        config=cfg,
-                    )
-                    rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-                except Exception:
-                    continue
+                ker = compute_pp_kernel(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s2),
+                    outgoing_spins=(s3, s4),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                )
+                rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         for iq, Q in enumerate(self.phd_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                try:
-                    ker = compute_ph_kernel(
-                        gamma,
-                        self.patchsets,
-                        Q,
-                        incoming_spins=(s1, s3),
-                        outgoing_spins=(s4, s2),
-                        config=cfg,
-                    )
-                    rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-                except Exception:
-                    continue
+                ker = compute_ph_kernel(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s3),
+                    outgoing_spins=(s4, s2),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                )
+                rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         for iq, Q in enumerate(self.phc_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                try:
-                    ker = compute_phc_kernel(
-                        gamma,
-                        self.patchsets,
-                        Q,
-                        incoming_spins=(s1, s2),
-                        outgoing_spins=(s3, s4),
-                        config=cfg,
-                    )
-                    rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-                except Exception:
-                    continue
+                ker = compute_phc_kernel(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s2),
+                    outgoing_spins=(s3, s4),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                )
+                rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         return rhs_pp, rhs_phd, rhs_phc
-
-    # ------------------------------
-    # Diagnosis kernels from reconstructed Gamma
-    # ------------------------------
 
     def _vertex_pp_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = np.asarray(Q, dtype=float)
@@ -677,10 +679,6 @@ class FRGFlowSolver:
                         }
         return best
 
-    # ------------------------------
-    # stepping and stopping
-    # ------------------------------
-
     def _apply_rhs(self, rhs_pp, rhs_phd, rhs_phc, scale: float) -> None:
         for key, mat in rhs_pp.items():
             self.state.pp_corr[key] += scale * np.asarray(mat, dtype=complex)
@@ -699,9 +697,9 @@ class FRGFlowSolver:
     def step(self, T_old: float, dT: float) -> FlowStepRecord:
         rhs_pp, rhs_phd, rhs_phc = self.compute_channel_rhs(T_old)
 
-        channel_norm = max(self.state.channel_norm(), 1e-14)
+        effective_norm = max(self.state.channel_norm(),self.bare_vertex_norm,1e-14)
         rhs_norm = self._rhs_norm(rhs_pp, rhs_phd, rhs_phc)
-        rel_update = abs(dT) * rhs_norm / channel_norm if channel_norm > 0 else abs(dT) * rhs_norm
+        rel_update = abs(dT) * rhs_norm / effective_norm
 
         n_sub = max(1, int(np.ceil(rel_update / self.max_relative_update))) if rel_update > self.max_relative_update else 1
         if (1.0 / n_sub) < self.min_substep_fraction:
