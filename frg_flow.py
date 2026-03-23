@@ -206,6 +206,8 @@ class FlowStepRecord:
     max_rel_update: float
     instability: bool = False
     instability_reason: Optional[str] = None
+    terminated_early: bool = False
+    termination_reason: Optional[str] = None
     leading_channel_name: Optional[str] = None
     leading_Q: Optional[np.ndarray] = None
     leading_eigenvalue_abs: Optional[float] = None
@@ -223,6 +225,8 @@ class FlowStepRecord:
             "max_rel_update": float(self.max_rel_update),
             "instability": bool(self.instability),
             "instability_reason": self.instability_reason,
+            "terminated_early": bool(self.terminated_early),
+            "termination_reason": self.termination_reason,
             "leading_channel_name": self.leading_channel_name,
             "leading_Q": None if self.leading_Q is None else np.asarray(self.leading_Q, dtype=float).tolist(),
             "leading_eigenvalue_abs": None if self.leading_eigenvalue_abs is None else float(self.leading_eigenvalue_abs),
@@ -598,6 +602,30 @@ class FRGFlowSolver:
             residuals=residuals,
         )
 
+    def _make_combined_kernel(
+        self,
+        *,
+        name: str,
+        Q: np.ndarray,
+        template: ChannelKernel,
+        matrix: np.ndarray,
+        row_tag: str,
+        col_tag: str,
+        residuals: np.ndarray,
+    ) -> ChannelKernel:
+        return ChannelKernel(
+            name=name,
+            Q=np.asarray(Q, dtype=float),
+            matrix=np.asarray(matrix, dtype=complex),
+            row_patches=template.row_patches.copy(),
+            col_patches=template.col_patches.copy(),
+            row_partner_patches=template.row_partner_patches.copy(),
+            col_partner_patches=template.col_partner_patches.copy(),
+            row_spins=(row_tag, row_tag),
+            col_spins=(col_tag, col_tag),
+            residuals=np.asarray(residuals, dtype=float),
+        )
+
     def build_diagnosis_kernel_dict(self, Q: Sequence[float]) -> Dict[str, ChannelKernel]:
         Q = np.asarray(Q, dtype=float)
         out: Dict[str, ChannelKernel] = {}
@@ -613,28 +641,22 @@ class FRGFlowSolver:
             out["pp_du_to_du"] = K_du_du
 
             template = K_ud_ud
-            out["pp_singlet_sz0"] = ChannelKernel(
+            out["pp_singlet_sz0"] = self._make_combined_kernel(
                 name="pp_singlet_sz0",
                 Q=Q,
+                template=template,
                 matrix=0.5 * (K_ud_ud.matrix - K_ud_du.matrix - K_du_ud.matrix + K_du_du.matrix),
-                row_patches=template.row_patches.copy(),
-                col_patches=template.col_patches.copy(),
-                row_partner_patches=template.row_partner_patches.copy(),
-                col_partner_patches=template.col_partner_patches.copy(),
-                row_spins=("S", "S"),
-                col_spins=("S", "S"),
+                row_tag="S",
+                col_tag="S",
                 residuals=template.residuals.copy(),
             )
-            out["pp_triplet_sz0"] = ChannelKernel(
+            out["pp_triplet_sz0"] = self._make_combined_kernel(
                 name="pp_triplet_sz0",
                 Q=Q,
+                template=template,
                 matrix=0.5 * (K_ud_ud.matrix + K_ud_du.matrix + K_du_ud.matrix + K_du_du.matrix),
-                row_patches=template.row_patches.copy(),
-                col_patches=template.col_patches.copy(),
-                row_partner_patches=template.row_partner_patches.copy(),
-                col_partner_patches=template.col_partner_patches.copy(),
-                row_spins=("T", "T"),
-                col_spins=("T", "T"),
+                row_tag="T",
+                col_tag="T",
                 residuals=template.residuals.copy(),
             )
 
@@ -650,37 +672,50 @@ class FRGFlowSolver:
             if self.track_crossed_channel:
                 out["phc_dd"] = self._vertex_phc_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
 
-        if "phd_uu" in out and "phd_dd" in out:
-            K_uu = out["phd_uu"]
-            K_dd = out["phd_dd"]
-            residuals = np.maximum(K_uu.residuals, K_dd.residuals)
-            out["ph_charge_longitudinal"] = ChannelKernel(
+        if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
+            K_uu_uu = self._vertex_phd_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
+            K_uu_dd = self._vertex_phd_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
+            K_dd_uu = self._vertex_phd_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up"))
+            K_dd_dd = self._vertex_phd_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
+            out["phd_uu_to_uu"] = K_uu_uu
+            out["phd_uu_to_dd"] = K_uu_dd
+            out["phd_dd_to_uu"] = K_dd_uu
+            out["phd_dd_to_dd"] = K_dd_dd
+
+            residuals = np.maximum.reduce([
+                K_uu_uu.residuals,
+                K_uu_dd.residuals,
+                K_dd_uu.residuals,
+                K_dd_dd.residuals,
+            ])
+            out["ph_charge_longitudinal"] = self._make_combined_kernel(
                 name="ph_charge_longitudinal",
                 Q=Q,
-                matrix=0.5 * (K_uu.matrix + K_dd.matrix),
-                row_patches=K_uu.row_patches.copy(),
-                col_patches=K_uu.col_patches.copy(),
-                row_partner_patches=K_uu.row_partner_patches.copy(),
-                col_partner_patches=K_uu.col_partner_patches.copy(),
-                row_spins=("rho", "rho"),
-                col_spins=("rho", "rho"),
+                template=K_uu_uu,
+                matrix=0.5 * (K_uu_uu.matrix + K_uu_dd.matrix + K_dd_uu.matrix + K_dd_dd.matrix),
+                row_tag="rho",
+                col_tag="rho",
                 residuals=residuals,
             )
-            out["ph_spin_longitudinal"] = ChannelKernel(
+            out["ph_spin_longitudinal"] = self._make_combined_kernel(
                 name="ph_spin_longitudinal",
                 Q=Q,
-                matrix=0.5 * (K_uu.matrix - K_dd.matrix),
-                row_patches=K_uu.row_patches.copy(),
-                col_patches=K_uu.col_patches.copy(),
-                row_partner_patches=K_uu.row_partner_patches.copy(),
-                col_partner_patches=K_uu.col_partner_patches.copy(),
-                row_spins=("sz", "sz"),
-                col_spins=("sz", "sz"),
+                template=K_uu_uu,
+                matrix=0.5 * (K_uu_uu.matrix - K_uu_dd.matrix - K_dd_uu.matrix + K_dd_dd.matrix),
+                row_tag="sz",
+                col_tag="sz",
                 residuals=residuals,
             )
         return out
 
     def diagnose_current_state(self) -> Dict[str, Any]:
+        preferred_names = {
+            "pp_singlet_sz0",
+            "pp_triplet_sz0",
+            "ph_charge_longitudinal",
+            "ph_spin_longitudinal",
+        }
+        fallback_prefixes = ("pp_triplet_", "phd_", "phc_")
         best_abs_eval = -np.inf
         best = {
             "channel_name": None,
@@ -688,34 +723,51 @@ class FRGFlowSolver:
             "abs_eigenvalue": None,
             "order_label": None,
             "diagnosis": None,
+            "all_candidates": [],
         }
 
+        candidates = []
         for Q in self.diagnosis_Qs:
             kernels = self.build_diagnosis_kernel_dict(Q)
-            for name, kernel in kernels.items():
+            preferred = [(name, ker) for name, ker in kernels.items() if name in preferred_names]
+            if preferred:
+                use = preferred
+            else:
+                use = [(name, ker) for name, ker in kernels.items() if name.startswith(fallback_prefixes)]
+
+            for name, kernel in use:
                 vals, _ = kernel.eig(sort_by=self.diagnosis_sort_by)
                 if len(vals) == 0:
                     continue
                 lam = float(np.abs(vals[0]))
+                diag_summary = None
+                order_label = None
+                if self.diagnoser is not None:
+                    diag = self.diagnoser.diagnose_kernel(kernel, sort_by=self.diagnosis_sort_by)
+                    diag_summary = diag.summary_dict()
+                    order_label = diag.paper_label
+                candidate = {
+                    "channel_name": name,
+                    "Q": np.asarray(Q, dtype=float),
+                    "abs_eigenvalue": lam,
+                    "order_label": order_label,
+                    "diagnosis": diag_summary,
+                }
+                candidates.append(candidate)
                 if lam > best_abs_eval:
                     best_abs_eval = lam
-                    if self.diagnoser is not None:
-                        diag = self.diagnoser.diagnose_kernel(kernel, sort_by=self.diagnosis_sort_by)
-                        best = {
-                            "channel_name": name,
-                            "Q": np.asarray(Q, dtype=float),
-                            "abs_eigenvalue": lam,
-                            "order_label": diag.paper_label,
-                            "diagnosis": diag.summary_dict(),
-                        }
-                    else:
-                        best = {
-                            "channel_name": name,
-                            "Q": np.asarray(Q, dtype=float),
-                            "abs_eigenvalue": lam,
-                            "order_label": None,
-                            "diagnosis": None,
-                        }
+                    best = dict(candidate)
+
+        candidates_sorted = sorted(candidates, key=lambda x: x["abs_eigenvalue"], reverse=True)
+        best["all_candidates"] = [
+            {
+                "channel_name": c["channel_name"],
+                "Q": c["Q"].tolist(),
+                "abs_eigenvalue": c["abs_eigenvalue"],
+                "order_label": c["order_label"],
+            }
+            for c in candidates_sorted
+        ]
         return best
 
     def _apply_rhs(self, rhs_pp, rhs_phd, rhs_phc, scale: float) -> None:
@@ -727,6 +779,8 @@ class FRGFlowSolver:
             self.state.phc_corr[key] += scale * np.asarray(mat, dtype=complex)
 
     def check_instability(self, record: FlowStepRecord) -> Tuple[bool, Optional[str]]:
+        if record.terminated_early:
+            return True, record.termination_reason or "flow terminated early"
         if record.channel_norm >= self.channel_divergence_threshold:
             return True, f"channel norm={record.channel_norm:.3e} exceeded channel_divergence_threshold"
         if record.leading_eigenvalue_abs is not None and record.leading_eigenvalue_abs >= self.eigenvalue_threshold:
@@ -742,8 +796,24 @@ class FRGFlowSolver:
 
         n_sub = max(1, int(np.ceil(rel_update / self.max_relative_update))) if rel_update > self.max_relative_update else 1
         if (1.0 / n_sub) < self.min_substep_fraction:
-            raise RuntimeError(
-                "Adaptive step control requested too many substeps. Reduce the temperature spacing or relax max_relative_update."
+            attempted_T_new = float(T_old + dT)
+            message = (
+                "Adaptive step control requested too many substeps; "
+                "stopping flow early and returning partial history. "
+                f"Current state remains at T={float(T_old):.8f}, attempted T_new={attempted_T_new:.8f}, "
+                f"rhs_norm={rhs_norm:.3e}, rel_update={rel_update:.3e}, proposed_n_sub={n_sub}. "
+                "Reduce temperature spacing or relax max_relative_update to continue further."
+            )
+            return FlowStepRecord(
+                step_index=len(self.history),
+                temperature=float(T_old),
+                dT=float(dT),
+                channel_norm=self.state.channel_norm(),
+                rhs_norm=rhs_norm,
+                accepted_substeps=0,
+                max_rel_update=rel_update,
+                terminated_early=True,
+                termination_reason=message,
             )
 
         sub_dT = dT / n_sub
@@ -791,7 +861,7 @@ class FRGFlowSolver:
             T_new = float(temps[i + 1])
             rec = self.step(T_old, T_new - T_old)
 
-            if ((i + 1) % self.diagnose_every) == 0 or i == len(temps) - 2:
+            if rec.terminated_early or ((i + 1) % self.diagnose_every) == 0 or i == len(temps) - 2:
                 payload = self.diagnose_current_state()
                 rec.leading_channel_name = payload.get("channel_name")
                 rec.leading_Q = payload.get("Q")
@@ -801,6 +871,9 @@ class FRGFlowSolver:
 
             rec.instability, rec.instability_reason = self.check_instability(rec)
             self.history.append(rec)
+
+            if rec.terminated_early and rec.termination_reason:
+                print(f"[FRGFlowSolver] {rec.termination_reason}")
 
             if rec.instability:
                 self.instability_record = rec

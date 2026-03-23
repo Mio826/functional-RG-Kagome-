@@ -416,79 +416,48 @@ class ChannelDecomposer:
             out["triplet_dd"] = blocks["dd_to_dd"]
         return out
 
-    def ph_longitudinal_blocks(self, Q) -> Dict[str, ChannelKernel]:
-        """
-        Raw longitudinal direct-ph blocks in the physical {up, dn} basis.
-
-        These are the ingredients needed to form charge / spin bilinears in the
-        {rho, sz} basis.  In particular, the mixed blocks
-
-            uu -> dd,   dd -> uu
-
-        must be retained; using only the diagonal same-spin blocks can
-        artificially suppress the longitudinal spin channel in SU(2)-symmetric
-        benchmarks.
-        """
-        Q = np.asarray(Q, dtype=float)
-        K_uu_uu = self.ph_direct_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-        K_uu_dd = self.ph_direct_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
-        K_dd_uu = self.ph_direct_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up"))
-        K_dd_dd = self.ph_direct_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-        return {
-            "uu_to_uu": K_uu_uu,
-            "uu_to_dd": K_uu_dd,
-            "dd_to_uu": K_dd_uu,
-            "dd_to_dd": K_dd_dd,
-        }
-
     def ph_charge_spin_longitudinal(self, Q) -> Dict[str, ChannelKernel]:
         """
-        Longitudinal charge / spin kernels in the {rho, sz} bilinear basis.
+        Longitudinal charge/spin-like combinations from same-spin direct ph blocks.
 
-        Correct combinations:
-
-            K_rho = 0.5 * (K_uu->uu + K_uu->dd + K_dd->uu + K_dd->dd)
-            K_sz  = 0.5 * (K_uu->uu - K_uu->dd - K_dd->uu + K_dd->dd)
-
-        We also return the raw blocks for debugging.
+        Requires both up and down same-spin ph blocks to exist.
         """
-        blocks = self.ph_longitudinal_blocks(Q)
-        K_uu_uu = blocks["uu_to_uu"]
-        K_uu_dd = blocks["uu_to_dd"]
-        K_dd_uu = blocks["dd_to_uu"]
-        K_dd_dd = blocks["dd_to_dd"]
+        K_uu = self.ph_direct_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
+        K_dd = self.ph_direct_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
 
-        charge = 0.5 * (
-            K_uu_uu.matrix + K_uu_dd.matrix + K_dd_uu.matrix + K_dd_dd.matrix
-        )
-        spin = 0.5 * (
-            K_uu_uu.matrix - K_uu_dd.matrix - K_dd_uu.matrix + K_dd_dd.matrix
-        )
-        residuals = np.maximum.reduce([
-            K_uu_uu.residuals,
-            K_uu_dd.residuals,
-            K_dd_uu.residuals,
-            K_dd_dd.residuals,
-        ])
+        charge = 0.5 * (K_uu.matrix + K_dd.matrix)
+        spin = 0.5 * (K_uu.matrix - K_dd.matrix)
 
-        def _make(name: str, matrix: np.ndarray, tag: str) -> ChannelKernel:
-            return ChannelKernel(
-                name=name,
-                Q=np.asarray(Q, dtype=float),
-                matrix=np.asarray(matrix, dtype=complex),
-                row_patches=K_uu_uu.row_patches.copy(),
-                col_patches=K_uu_uu.col_patches.copy(),
-                row_partner_patches=K_uu_uu.row_partner_patches.copy(),
-                col_partner_patches=K_uu_uu.col_partner_patches.copy(),
-                row_spins=(tag, tag),
-                col_spins=(tag, tag),
-                residuals=np.asarray(residuals, dtype=float),
-            )
+        charge_kernel = ChannelKernel(
+            name="ph_charge_longitudinal",
+            Q=np.asarray(Q, dtype=float),
+            matrix=charge,
+            row_patches=K_uu.row_patches.copy(),
+            col_patches=K_uu.col_patches.copy(),
+            row_partner_patches=K_uu.row_partner_patches.copy(),
+            col_partner_patches=K_uu.col_partner_patches.copy(),
+            row_spins=("rho", "rho"),
+            col_spins=("rho", "rho"),
+            residuals=np.maximum(K_uu.residuals, K_dd.residuals),
+        )
+        spin_kernel = ChannelKernel(
+            name="ph_spin_longitudinal",
+            Q=np.asarray(Q, dtype=float),
+            matrix=spin,
+            row_patches=K_uu.row_patches.copy(),
+            col_patches=K_uu.col_patches.copy(),
+            row_partner_patches=K_uu.row_partner_patches.copy(),
+            col_partner_patches=K_uu.col_partner_patches.copy(),
+            row_spins=("sz", "sz"),
+            col_spins=("sz", "sz"),
+            residuals=np.maximum(K_uu.residuals, K_dd.residuals),
+        )
 
         return {
-            "charge": _make("ph_charge_longitudinal", charge, "rho"),
-            "spin": _make("ph_spin_longitudinal", spin, "sz"),
-            **blocks,
+            "charge": charge_kernel,
+            "spin": spin_kernel,
+            "uu": K_uu,
+            "dd": K_dd,
         }
 
     def build_all_basic_channels(self, Q) -> Dict[str, ChannelKernel]:

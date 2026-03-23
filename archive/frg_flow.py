@@ -36,16 +36,25 @@ except Exception:
                 raise ValueError("sort_by must be 'abs' or 'real'.")
             return vals[order], vecs[:, order]
 
-
 from frg_kernel import (
     FlowConfig,
-    compute_pp_kernel,
-    compute_ph_kernel,
-    compute_phc_kernel,
+    compute_pp_kernel_fast,
+    compute_ph_kernel_fast,
+    compute_phc_kernel_fast,
     normalize_spin,
     patchset_for_spin,
     shifted_patch_map,
     has_patchset,
+)
+
+
+from frg_kernel import (
+    available_internal_spin_pairs,
+    build_ph_internal_cache_vec,
+    build_pp_internal_cache_vec,
+    compute_ph_kernel_fast2,
+    compute_phc_kernel_fast2,
+    compute_pp_kernel_fast2,
 )
 
 try:
@@ -76,10 +85,6 @@ def available_physical_spins(patchsets: PatchSetMap) -> List[str]:
 
 
 def default_spin_blocks(patchsets: PatchSetMap) -> List[SpinBlock]:
-    """
-    Full antisymmetrized density-density problem needs six spin blocks:
-      uuuu, dddd, udud, uddu, duud, dudu
-    """
     spins = available_physical_spins(patchsets)
     blocks: List[SpinBlock] = []
     if "up" in spins:
@@ -99,14 +104,9 @@ def default_spin_blocks(patchsets: PatchSetMap) -> List[SpinBlock]:
 
 
 class BareVertexFromInteraction:
-    """
-    Callable bare antisymmetrized vertex accessor:
-        gamma(p1,s1,p2,s2,p3,s3,p4,s4)
-    """
     def __init__(self, interaction: Any, patchsets: PatchSetMap):
         self.interaction = interaction
         self.patchsets = patchsets
-        
 
     def __call__(self, p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
         return complex(
@@ -128,9 +128,6 @@ def _reduced_coords(k: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> np.ndarray
 
 
 class TransferGrid:
-    """
-    Wrapped-Q lookup table for one channel.
-    """
     def __init__(self, patchsets: PatchSetMap, q_list: Sequence[Sequence[float]], *, decimals: int = 10):
         ref_spin = available_physical_spins(patchsets)[0]
         ps = patchset_for_spin(patchsets, ref_spin)
@@ -157,9 +154,6 @@ class TransferGrid:
 
 
 def build_unique_q_list(patchsets: PatchSetMap, *, mode: str, decimals: int = 10) -> List[np.ndarray]:
-    """
-    Build wrapped unique transfer momenta from patch representatives.
-    """
     ref_spin = available_physical_spins(patchsets)[0]
     ps = patchset_for_spin(patchsets, ref_spin)
     ks = np.asarray([p.k_cart for p in ps.patches], dtype=float)
@@ -212,6 +206,8 @@ class FlowStepRecord:
     max_rel_update: float
     instability: bool = False
     instability_reason: Optional[str] = None
+    terminated_early: bool = False
+    termination_reason: Optional[str] = None
     leading_channel_name: Optional[str] = None
     leading_Q: Optional[np.ndarray] = None
     leading_eigenvalue_abs: Optional[float] = None
@@ -229,6 +225,8 @@ class FlowStepRecord:
             "max_rel_update": float(self.max_rel_update),
             "instability": bool(self.instability),
             "instability_reason": self.instability_reason,
+            "terminated_early": bool(self.terminated_early),
+            "termination_reason": self.termination_reason,
             "leading_channel_name": self.leading_channel_name,
             "leading_Q": None if self.leading_Q is None else np.asarray(self.leading_Q, dtype=float).tolist(),
             "leading_eigenvalue_abs": None if self.leading_eigenvalue_abs is None else float(self.leading_eigenvalue_abs),
@@ -237,22 +235,27 @@ class FlowStepRecord:
         }
 
 
+@dataclass
+class FastVertexEvaluator:
+    solver: "FRGFlowSolver"
+
+    def __call__(self, p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
+        slv = self.solver
+        s1n, s2n, s3n, s4n = canonical_spin_tuple((s1, s2, s3, s4))
+        val = complex(slv.state.bare_gamma(p1, s1n, p2, s2n, p3, s3n, p4, s4n))
+
+        iq_pp = slv._pp_q_index[(s1n, s2n)][p1, p2]
+        val += complex(slv.state.pp_corr[(s1n, s2n, s3n, s4n, iq_pp)][p3, p1])
+
+        iq_phd = slv._phd_q_index[(s3n, s1n)][p3, p1]
+        val += complex(slv.state.phd_corr[(s1n, s2n, s3n, s4n, iq_phd)][p4, p1])
+
+        iq_phc = slv._phc_q_index[(s3n, s2n)][p3, p2]
+        val += complex(slv.state.phc_corr[(s1n, s2n, s3n, s4n, iq_phc)][p2, p1])
+        return val
+
+
 class FRGFlowSolver:
-    """
-    Channel-stored temperature-flow solver.
-
-    The flowing vertex is represented as:
-        Gamma = Gamma_bare + Phi_pp + Phi_phd + Phi_phc
-
-    Each Phi is stored as:
-        (s1,s2,s3,s4,Q_index) -> matrix(Np, Np)
-
-    Matrix conventions:
-      pp  : matrix[p3, p1]
-      phd : matrix[p4, p1]
-      phc : matrix[p2, p1]
-    """
-
     def __init__(
         self,
         *,
@@ -282,8 +285,7 @@ class FRGFlowSolver:
         self.bare_gamma = bare_gamma
         self.spin_blocks = [canonical_spin_tuple(x) for x in (spin_blocks or default_spin_blocks(patchsets))]
         self.allowed_spin_blocks = frozenset(self.spin_blocks)
-        self.bare_vertex_norm = self._estimate_bare_vertex_norm()
-        
+
         if pp_Qs is None:
             pp_Qs = build_unique_q_list(patchsets, mode="pp")
         if ph_Qs is None:
@@ -338,9 +340,56 @@ class FRGFlowSolver:
             phc_corr=self._empty_channel_store(self.phc_grid),
         )
 
+        self._precompute_transfer_tables()
+        self._fast_gamma = FastVertexEvaluator(self)
+        self.bare_vertex_norm = self._estimate_bare_vertex_norm()
+
         self.temperature_path = self._build_temperature_path()
         self.history: List[FlowStepRecord] = []
         self.instability_record: Optional[FlowStepRecord] = None
+
+    def _all_spins_present(self) -> List[str]:
+        return available_physical_spins(self.patchsets)
+
+    def _patch_k_array(self, spin: str) -> np.ndarray:
+        ps = patchset_for_spin(self.patchsets, spin)
+        return np.asarray([p.k_cart for p in ps.patches], dtype=float)
+
+    def _precompute_transfer_tables(self) -> None:
+        spins = self._all_spins_present()
+        self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phd_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phc_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+
+        for s1 in spins:
+            k1s = self._patch_k_array(s1)
+            for s2 in spins:
+                k2s = self._patch_k_array(s2)
+                arr = np.zeros((len(k1s), len(k2s)), dtype=int)
+                for p1, k1 in enumerate(k1s):
+                    for p2, k2 in enumerate(k2s):
+                        arr[p1, p2] = self.pp_grid.nearest_index(k1 + k2)
+                self._pp_q_index[(s1, s2)] = arr
+
+        for s3 in spins:
+            k3s = self._patch_k_array(s3)
+            for s1 in spins:
+                k1s = self._patch_k_array(s1)
+                arr = np.zeros((len(k3s), len(k1s)), dtype=int)
+                for p3, k3 in enumerate(k3s):
+                    for p1, k1 in enumerate(k1s):
+                        arr[p3, p1] = self.phd_grid.nearest_index(k3 - k1)
+                self._phd_q_index[(s3, s1)] = arr
+
+        for s3 in spins:
+            k3s = self._patch_k_array(s3)
+            for s2 in spins:
+                k2s = self._patch_k_array(s2)
+                arr = np.zeros((len(k3s), len(k2s)), dtype=int)
+                for p3, k3 in enumerate(k3s):
+                    for p2, k2 in enumerate(k2s):
+                        arr[p3, p2] = self.phc_grid.nearest_index(k3 - k2)
+                self._phc_q_index[(s3, s2)] = arr
 
     def _empty_channel_store(self, grid: TransferGrid) -> Dict[ChannelKey, np.ndarray]:
         ref_spin = available_physical_spins(self.patchsets)[0]
@@ -368,16 +417,11 @@ class FRGFlowSolver:
         if mat is None:
             return 0.0 + 0.0j
         return complex(mat[i, j])
-        
+
     def _estimate_bare_vertex_norm(self, sample_cap: int = 6) -> float:
-        """
-        Estimate a typical scale of the bare vertex for adaptive step control.
-        We only need an order-of-magnitude stable normalization, not an exact extremum.
-        """
-        ref_spin = list(self.patchsets.keys())[0]
-        Np = self.patchsets[ref_spin].Npatch
+        ref_spin = available_physical_spins(self.patchsets)[0]
+        Np = patchset_for_spin(self.patchsets, ref_spin).Npatch
         P = min(sample_cap, Np)
-    
         vals = []
         for (s1, s2, s3, s4) in self.spin_blocks:
             for p1 in range(P):
@@ -385,11 +429,10 @@ class FRGFlowSolver:
                     for p3 in range(P):
                         p4 = 0
                         vals.append(abs(self.bare_gamma(p1, s1, p2, s2, p3, s3, p4, s4)))
-    
         if not vals:
             return 1e-14
         return max(float(np.max(vals)), 1e-14)
-    
+
     def gamma_accessor(self) -> GammaAccessor:
         state = self.state
 
@@ -421,7 +464,7 @@ class FRGFlowSolver:
         return max(vals) if vals else 0.0
 
     def compute_channel_rhs(self, T: float):
-        gamma = self.gamma_accessor()
+        gamma = self._fast_gamma
         cfg = self._flow_config(T)
 
         rhs_pp = self._empty_channel_store(self.pp_grid)
@@ -430,7 +473,7 @@ class FRGFlowSolver:
 
         for iq, Q in enumerate(self.pp_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_pp_kernel(
+                ker = compute_pp_kernel_fast(
                     gamma,
                     self.patchsets,
                     Q,
@@ -443,7 +486,7 @@ class FRGFlowSolver:
 
         for iq, Q in enumerate(self.phd_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_ph_kernel(
+                ker = compute_ph_kernel_fast(
                     gamma,
                     self.patchsets,
                     Q,
@@ -456,7 +499,7 @@ class FRGFlowSolver:
 
         for iq, Q in enumerate(self.phc_grid.q_list):
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_phc_kernel(
+                ker = compute_phc_kernel_fast(
                     gamma,
                     self.patchsets,
                     Q,
@@ -471,7 +514,7 @@ class FRGFlowSolver:
 
     def _vertex_pp_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = np.asarray(Q, dtype=float)
-        gamma = self.gamma_accessor()
+        gamma = self._fast_gamma
         s1, s2 = map(normalize_spin, incoming_spins)
         s3, s4 = map(normalize_spin, outgoing_spins)
         ps_in = patchset_for_spin(self.patchsets, s1)
@@ -501,7 +544,7 @@ class FRGFlowSolver:
 
     def _vertex_phd_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = np.asarray(Q, dtype=float)
-        gamma = self.gamma_accessor()
+        gamma = self._fast_gamma
         s1, s3 = map(normalize_spin, incoming_spins)
         s4, s2 = map(normalize_spin, outgoing_spins)
         ps1 = patchset_for_spin(self.patchsets, s1)
@@ -531,7 +574,7 @@ class FRGFlowSolver:
 
     def _vertex_phc_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = np.asarray(Q, dtype=float)
-        gamma = self.gamma_accessor()
+        gamma = self._fast_gamma
         s1, s2 = map(normalize_spin, incoming_spins)
         s3, s4 = map(normalize_spin, outgoing_spins)
         ps1 = patchset_for_spin(self.patchsets, s1)
@@ -688,6 +731,8 @@ class FRGFlowSolver:
             self.state.phc_corr[key] += scale * np.asarray(mat, dtype=complex)
 
     def check_instability(self, record: FlowStepRecord) -> Tuple[bool, Optional[str]]:
+        if record.terminated_early:
+            return True, record.termination_reason or "flow terminated early"
         if record.channel_norm >= self.channel_divergence_threshold:
             return True, f"channel norm={record.channel_norm:.3e} exceeded channel_divergence_threshold"
         if record.leading_eigenvalue_abs is not None and record.leading_eigenvalue_abs >= self.eigenvalue_threshold:
@@ -697,14 +742,30 @@ class FRGFlowSolver:
     def step(self, T_old: float, dT: float) -> FlowStepRecord:
         rhs_pp, rhs_phd, rhs_phc = self.compute_channel_rhs(T_old)
 
-        effective_norm = max(self.state.channel_norm(),self.bare_vertex_norm,1e-14)
+        effective_norm = max(self.state.channel_norm(), self.bare_vertex_norm, 1e-14)
         rhs_norm = self._rhs_norm(rhs_pp, rhs_phd, rhs_phc)
         rel_update = abs(dT) * rhs_norm / effective_norm
 
         n_sub = max(1, int(np.ceil(rel_update / self.max_relative_update))) if rel_update > self.max_relative_update else 1
         if (1.0 / n_sub) < self.min_substep_fraction:
-            raise RuntimeError(
-                "Adaptive step control requested too many substeps. Reduce the temperature spacing or relax max_relative_update."
+            attempted_T_new = float(T_old + dT)
+            message = (
+                "Adaptive step control requested too many substeps; "
+                "stopping flow early and returning partial history. "
+                f"Current state remains at T={float(T_old):.8f}, attempted T_new={attempted_T_new:.8f}, "
+                f"rhs_norm={rhs_norm:.3e}, rel_update={rel_update:.3e}, proposed_n_sub={n_sub}. "
+                "Reduce temperature spacing or relax max_relative_update to continue further."
+            )
+            return FlowStepRecord(
+                step_index=len(self.history),
+                temperature=float(T_old),
+                dT=float(dT),
+                channel_norm=self.state.channel_norm(),
+                rhs_norm=rhs_norm,
+                accepted_substeps=0,
+                max_rel_update=rel_update,
+                terminated_early=True,
+                termination_reason=message,
             )
 
         sub_dT = dT / n_sub
@@ -752,7 +813,7 @@ class FRGFlowSolver:
             T_new = float(temps[i + 1])
             rec = self.step(T_old, T_new - T_old)
 
-            if ((i + 1) % self.diagnose_every) == 0 or i == len(temps) - 2:
+            if rec.terminated_early or ((i + 1) % self.diagnose_every) == 0 or i == len(temps) - 2:
                 payload = self.diagnose_current_state()
                 rec.leading_channel_name = payload.get("channel_name")
                 rec.leading_Q = payload.get("Q")
@@ -762,6 +823,9 @@ class FRGFlowSolver:
 
             rec.instability, rec.instability_reason = self.check_instability(rec)
             self.history.append(rec)
+
+            if rec.terminated_early and rec.termination_reason:
+                print(f"[FRGFlowSolver] {rec.termination_reason}")
 
             if rec.instability:
                 self.instability_record = rec
@@ -773,7 +837,122 @@ class FRGFlowSolver:
         return [x.summary_dict() for x in self.history]
 
     def current_gamma_accessor(self) -> GammaAccessor:
-        return self.gamma_accessor()
+        return self._fast_gamma
+
+
+
+# ===== Final stage-2 optimized solver =====
+class FRGFlowSolver(FRGFlowSolver):
+    """Final optimized solver.
+
+    Keeps the stage-1 fast vertex evaluator / transfer-index cache, and adds
+    Q-level internal-cache reuse plus vectorized bubble frequency sums.
+    Physics is unchanged relative to the reference solver.
+    """
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._precompute_shift_maps()
+
+    def _precompute_shift_maps(self) -> None:
+        spins = self._all_spins_present()
+        self._pp_qminus = {}
+        self._ph_kplus = {}
+        self._phc_kplus = {}
+        self._phc_kminus = {}
+
+        for iq, Q in enumerate(self.pp_grid.q_list):
+            Q = np.asarray(Q, dtype=float)
+            for s in spins:
+                self._pp_qminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="Q_minus_k")
+
+        for iq, Q in enumerate(self.phd_grid.q_list):
+            Q = np.asarray(Q, dtype=float)
+            for s in spins:
+                self._ph_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
+
+        for iq, Q in enumerate(self.phc_grid.q_list):
+            Q = np.asarray(Q, dtype=float)
+            for s in spins:
+                self._phc_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
+                self._phc_kminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_minus_Q")
+
+    def _build_q_level_internal_caches(self, T: float):
+        cfg = self._flow_config(T)
+        pp_internal_by_iq = {}
+        ph_internal_by_iq = {}
+        for iq, Q in enumerate(self.pp_grid.q_list):
+            shift_cache = {(sa, sb): self._pp_qminus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            pp_internal_by_iq[iq] = build_pp_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
+        for iq, Q in enumerate(self.phd_grid.q_list):
+            shift_cache = {(sa, sb): self._ph_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            ph_internal_by_iq[iq] = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
+        return cfg, pp_internal_by_iq, ph_internal_by_iq
+
+    def compute_channel_rhs(self, T: float):
+        gamma = self._fast_gamma
+        cfg, pp_internal_by_iq, ph_internal_by_iq = self._build_q_level_internal_caches(T)
+
+        rhs_pp = self._empty_channel_store(self.pp_grid)
+        rhs_phd = self._empty_channel_store(self.phd_grid)
+        rhs_phc = self._empty_channel_store(self.phc_grid)
+
+        for iq, Q in enumerate(self.pp_grid.q_list):
+            internal_cache = pp_internal_by_iq[iq]
+            for s1, s2, s3, s4 in self.spin_blocks:
+                ker = compute_pp_kernel_fast2(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s2),
+                    outgoing_spins=(s3, s4),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_in_resid=self._pp_qminus[(iq, s2)],
+                    partner_out_resid=self._pp_qminus[(iq, s4)],
+                )
+                rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
+
+        for iq, Q in enumerate(self.phd_grid.q_list):
+            internal_cache = ph_internal_by_iq[iq]
+            for s1, s2, s3, s4 in self.spin_blocks:
+                ker = compute_ph_kernel_fast2(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s3),
+                    outgoing_spins=(s4, s2),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_in_resid=self._ph_kplus[(iq, s3)],
+                    partner_out_resid=self._ph_kplus[(iq, s2)],
+                )
+                rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
+
+        for iq, Q in enumerate(self.phc_grid.q_list):
+            shift_cache = {(sa, sb): self._phc_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            internal_cache = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
+            for s1, s2, s3, s4 in self.spin_blocks:
+                ker = compute_phc_kernel_fast2(
+                    gamma,
+                    self.patchsets,
+                    Q,
+                    incoming_spins=(s1, s2),
+                    outgoing_spins=(s3, s4),
+                    config=cfg,
+                    allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_in_resid=self._phc_kminus[(iq, s4)],
+                    partner_out_resid=self._phc_kplus[(iq, s3)],
+                )
+                rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
+
+        return rhs_pp, rhs_phd, rhs_phc
+
+    def current_gamma_accessor(self):
+        return self._fast_gamma
 
 
 __all__ = [
