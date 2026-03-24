@@ -102,6 +102,33 @@ def available_internal_spin_pairs(patchsets: PatchSetMap):
     return out
 
 
+
+
+def _reduced_coords(k: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
+    B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
+    return np.linalg.solve(B, np.asarray(k, dtype=float))
+
+
+def _wrap_reduced_coords_unit(uv: np.ndarray) -> np.ndarray:
+    """Map reduced coordinates to the unique half-open cell [0, 1)."""
+    uv = np.asarray(uv, dtype=float)
+    uv = uv - np.floor(uv)
+    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+    return uv
+
+
+def canonicalize_q_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
+    """Canonicalize momentum transfer q modulo reciprocal lattice vectors using a unique [0,1) reduced-cell representative."""
+    ref_spin = 'up' if has_patchset(patchsets, 'up') else 'dn'
+    ps = patchset_for_spin(patchsets, ref_spin)
+    B = np.column_stack([np.asarray(ps.b1, dtype=float), np.asarray(ps.b2, dtype=float)])
+    uv = np.linalg.solve(B, np.asarray(q, dtype=float))
+    uv = _wrap_reduced_coords_unit(uv)
+    q_can = B @ uv
+    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
+    return q_can
+
 def _minimum_image_displacement(k_target: Sequence[float], k_ref: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
     k_target = np.asarray(k_target, dtype=float)
     k_ref = np.asarray(k_ref, dtype=float)
@@ -133,7 +160,7 @@ def find_shifted_patch_index(patchsets: PatchSetMap, spin: SpinLike, target_k: S
 
 def shifted_patch_map(patchsets: PatchSetMap, spin: SpinLike, Q: Sequence[float], mode: str) -> Tuple[np.ndarray, np.ndarray]:
     ps = patchset_for_spin(patchsets, spin)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     idxs = np.zeros(ps.Npatch, dtype=int)
     residuals = np.zeros(ps.Npatch, dtype=float)
 
@@ -150,6 +177,79 @@ def shifted_patch_map(patchsets: PatchSetMap, spin: SpinLike, Q: Sequence[float]
         idxs[p], residuals[p] = find_shifted_patch_index(patchsets, spin, target)
     return idxs, residuals
 
+
+
+
+def _periodic_distance_to_target(target_k: Sequence[float], ref_k: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> float:
+    return float(np.linalg.norm(_minimum_image_displacement(target_k, ref_k, b1, b2)))
+
+
+def partner_map_from_q_index(
+    patchsets: PatchSetMap,
+    q_index_table: np.ndarray,
+    *,
+    source_spin: SpinLike,
+    target_spin: SpinLike,
+    iq_target: int,
+    Q: Sequence[float],
+    mode: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Deterministically choose one target-leg patch for each source-leg patch while
+    enforcing that the chosen pair belongs to the requested transfer-momentum block
+    ``iq_target``.
+
+    This is the Q-consistent alternative to ``shifted_patch_map`` used when a
+    channel block is already discretized by an explicit transfer grid. Among all
+    candidates compatible with ``iq_target`` we choose the one closest to the
+    geometrically shifted target momentum.
+    """
+    src_spin = normalize_spin(source_spin)
+    tgt_spin = normalize_spin(target_spin)
+    ps_src = patchset_for_spin(patchsets, src_spin)
+    ps_tgt = patchset_for_spin(patchsets, tgt_spin)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
+
+    q_index_table = np.asarray(q_index_table, dtype=int)
+    if q_index_table.shape != (ps_src.Npatch, ps_tgt.Npatch):
+        raise ValueError(
+            f"q_index_table shape {q_index_table.shape} incompatible with patch counts "
+            f"({ps_src.Npatch}, {ps_tgt.Npatch})."
+        )
+
+    ks_tgt = np.asarray([p.k_cart for p in ps_tgt.patches], dtype=float)
+    idxs = np.zeros(ps_src.Npatch, dtype=int)
+    residuals = np.zeros(ps_src.Npatch, dtype=float)
+
+    for p_src, patch in enumerate(ps_src.patches):
+        k_src = np.asarray(patch.k_cart, dtype=float)
+        if mode == "Q_minus_k":
+            target = Q - k_src
+        elif mode == "k_plus_Q":
+            target = k_src + Q
+        elif mode == "k_minus_Q":
+            target = k_src - Q
+        else:
+            raise ValueError("mode must be one of {'Q_minus_k', 'k_plus_Q', 'k_minus_Q'}")
+
+        candidates = np.flatnonzero(q_index_table[p_src, :] == int(iq_target))
+        if candidates.size == 0:
+            idxs[p_src] = -1
+            residuals[p_src] = np.inf
+            continue
+
+        best_idx = None
+        best_dist = np.inf
+        for cand in candidates.tolist():
+            dist = _periodic_distance_to_target(target, ks_tgt[cand], ps_tgt.b1, ps_tgt.b2)
+            if dist < best_dist - 1e-14 or (abs(dist - best_dist) <= 1e-14 and (best_idx is None or cand < best_idx)):
+                best_dist = dist
+                best_idx = int(cand)
+
+        idxs[p_src] = int(best_idx)
+        residuals[p_src] = float(best_dist)
+
+    return idxs, residuals
 
 def _patch_energies(ps) -> np.ndarray:
     return np.array([float(p.energy) for p in ps.patches], dtype=float)
@@ -278,7 +378,7 @@ def compute_pp_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -352,7 +452,7 @@ def compute_ph_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -435,7 +535,7 @@ def compute_phc_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1
@@ -518,7 +618,7 @@ def compute_pp_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -592,7 +692,7 @@ def compute_ph_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -633,22 +733,38 @@ def compute_ph_kernel_fast(
             L2 = np.empty((Na, N), dtype=complex)
             R2 = np.empty((Na, N), dtype=complex)
 
+        valid_in = kplus_in >= 0
+        valid_out = kplus_out >= 0
         for a in range(Na):
             b = int(partner[a])
+            if b < 0 or abs(weights[a]) == 0:
+                if keep1:
+                    L1[a, :] = 0.0; R1[a, :] = 0.0
+                if keep2:
+                    L2[a, :] = 0.0; R2[a, :] = 0.0
+                continue
             for pin in range(N):
                 p1 = pin
-                p3 = int(kplus_in[pin])
-                if keep1:
-                    L1[a, pin] = gamma_fn(p1, s1, a, sa, p3, s3, b, sb)
-                if keep2:
-                    L2[a, pin] = gamma_fn(p1, s1, b, sb, p3, s3, a, sa)
+                if valid_in[pin]:
+                    p3 = int(kplus_in[pin])
+                    if keep1:
+                        L1[a, pin] = gamma_fn(p1, s1, a, sa, p3, s3, b, sb)
+                    if keep2:
+                        L2[a, pin] = gamma_fn(p1, s1, b, sb, p3, s3, a, sa)
+                else:
+                    if keep1: L1[a, pin] = 0.0
+                    if keep2: L2[a, pin] = 0.0
             for pout in range(N):
                 p4 = pout
-                p2 = int(kplus_out[pout])
-                if keep1:
-                    R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p4, s4)
-                if keep2:
-                    R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p4, s4)
+                if valid_out[pout]:
+                    p2 = int(kplus_out[pout])
+                    if keep1:
+                        R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p4, s4)
+                    if keep2:
+                        R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p4, s4)
+                else:
+                    if keep1: R1[a, pout] = 0.0
+                    if keep2: R2[a, pout] = 0.0
 
         if keep1:
             K -= (weights[:, None] * R1).T @ L1
@@ -684,7 +800,7 @@ def compute_phc_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1
@@ -725,22 +841,38 @@ def compute_phc_kernel_fast(
             L2 = np.empty((Na, N), dtype=complex)
             R2 = np.empty((Na, N), dtype=complex)
 
+        valid_in = kminus_in >= 0
+        valid_out = kplus_out >= 0
         for a in range(Na):
             b = int(partner[a])
+            if b < 0 or abs(weights[a]) == 0:
+                if keep1:
+                    L1[a, :] = 0.0; R1[a, :] = 0.0
+                if keep2:
+                    L2[a, :] = 0.0; R2[a, :] = 0.0
+                continue
             for pin in range(N):
                 p1 = pin
-                p4 = int(kminus_in[pin])
-                if keep1:
-                    L1[a, pin] = gamma_fn(p1, s1, a, sa, p4, s4, b, sb)
-                if keep2:
-                    L2[a, pin] = gamma_fn(p1, s1, b, sb, p4, s4, a, sa)
+                if valid_in[pin]:
+                    p4 = int(kminus_in[pin])
+                    if keep1:
+                        L1[a, pin] = gamma_fn(p1, s1, a, sa, p4, s4, b, sb)
+                    if keep2:
+                        L2[a, pin] = gamma_fn(p1, s1, b, sb, p4, s4, a, sa)
+                else:
+                    if keep1: L1[a, pin] = 0.0
+                    if keep2: L2[a, pin] = 0.0
             for pout in range(N):
                 p2 = pout
-                p3 = int(kplus_out[pout])
-                if keep1:
-                    R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p3, s3)
-                if keep2:
-                    R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p3, s3)
+                if valid_out[pout]:
+                    p3 = int(kplus_out[pout])
+                    if keep1:
+                        R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p3, s3)
+                    if keep2:
+                        R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p3, s3)
+                else:
+                    if keep1: R1[a, pout] = 0.0
+                    if keep2: R2[a, pout] = 0.0
 
         if keep1:
             K += (weights[:, None] * R1).T @ L1
@@ -839,7 +971,10 @@ def build_pp_internal_cache_vec(
             partner, residual = shifted_patch_map(patchsets, sb, Q, mode="Q_minus_k")
         partner = np.asarray(partner, dtype=int)
         residual = np.asarray(residual, dtype=float)
-        weights = _bubble_dot_pp_vec(eps_a, eps_b_all[partner], config)
+        weights = np.zeros_like(eps_a, dtype=complex)
+        valid = partner >= 0
+        if np.any(valid):
+            weights[valid] = _bubble_dot_pp_vec(eps_a[valid], eps_b_all[partner[valid]], config)
         cache[(sa, sb)] = {
             "partner": partner,
             "residual": residual,
@@ -868,7 +1003,10 @@ def build_ph_internal_cache_vec(
             partner, residual = shifted_patch_map(patchsets, sb, Q, mode="k_plus_Q")
         partner = np.asarray(partner, dtype=int)
         residual = np.asarray(residual, dtype=float)
-        weights = _bubble_dot_ph_vec(eps_a, eps_b_all[partner], config)
+        weights = np.zeros_like(eps_a, dtype=complex)
+        valid = partner >= 0
+        if np.any(valid):
+            weights[valid] = _bubble_dot_ph_vec(eps_a[valid], eps_b_all[partner[valid]], config)
         cache[(sa, sb)] = {
             "partner": partner,
             "residual": residual,
@@ -895,7 +1033,7 @@ def compute_pp_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -939,12 +1077,24 @@ def compute_pp_kernel_fast2(
 
         L = np.empty((Na, N), dtype=complex)
         R = np.empty((Na, N), dtype=complex)
+        valid_in = partner_in >= 0
+        valid_out = partner_out >= 0
         for a in range(Na):
             b = int(partner[a])
+            if b < 0 or abs(weights[a]) == 0:
+                L[a, :] = 0.0
+                R[a, :] = 0.0
+                continue
             for pin in range(N):
-                L[a, pin] = gamma_fn(pin, s1, int(partner_in[pin]), s2, a, sa, b, sb)
+                if valid_in[pin]:
+                    L[a, pin] = gamma_fn(pin, s1, int(partner_in[pin]), s2, a, sa, b, sb)
+                else:
+                    L[a, pin] = 0.0
             for pout in range(N):
-                R[a, pout] = gamma_fn(a, sa, b, sb, pout, s3, int(partner_out[pout]), s4)
+                if valid_out[pout]:
+                    R[a, pout] = gamma_fn(a, sa, b, sb, pout, s3, int(partner_out[pout]), s4)
+                else:
+                    R[a, pout] = 0.0
 
         K += (weights[:, None] * R).T @ L
         residuals = np.maximum(residuals, float(np.max(np.asarray(info["residual"], dtype=float))))
@@ -981,7 +1131,7 @@ def compute_ph_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -1034,22 +1184,38 @@ def compute_ph_kernel_fast2(
             L2 = np.empty((Na, N), dtype=complex)
             R2 = np.empty((Na, N), dtype=complex)
 
+        valid_in = kplus_in >= 0
+        valid_out = kplus_out >= 0
         for a in range(Na):
             b = int(partner[a])
+            if b < 0 or abs(weights[a]) == 0:
+                if keep1:
+                    L1[a, :] = 0.0; R1[a, :] = 0.0
+                if keep2:
+                    L2[a, :] = 0.0; R2[a, :] = 0.0
+                continue
             for pin in range(N):
                 p1 = pin
-                p3 = int(kplus_in[pin])
-                if keep1:
-                    L1[a, pin] = gamma_fn(p1, s1, a, sa, p3, s3, b, sb)
-                if keep2:
-                    L2[a, pin] = gamma_fn(p1, s1, b, sb, p3, s3, a, sa)
+                if valid_in[pin]:
+                    p3 = int(kplus_in[pin])
+                    if keep1:
+                        L1[a, pin] = gamma_fn(p1, s1, a, sa, p3, s3, b, sb)
+                    if keep2:
+                        L2[a, pin] = gamma_fn(p1, s1, b, sb, p3, s3, a, sa)
+                else:
+                    if keep1: L1[a, pin] = 0.0
+                    if keep2: L2[a, pin] = 0.0
             for pout in range(N):
                 p4 = pout
-                p2 = int(kplus_out[pout])
-                if keep1:
-                    R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p4, s4)
-                if keep2:
-                    R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p4, s4)
+                if valid_out[pout]:
+                    p2 = int(kplus_out[pout])
+                    if keep1:
+                        R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p4, s4)
+                    if keep2:
+                        R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p4, s4)
+                else:
+                    if keep1: R1[a, pout] = 0.0
+                    if keep2: R2[a, pout] = 0.0
 
         if keep1:
             K -= (weights[:, None] * R1).T @ L1
@@ -1089,7 +1255,7 @@ def compute_phc_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1
@@ -1142,22 +1308,38 @@ def compute_phc_kernel_fast2(
             L2 = np.empty((Na, N), dtype=complex)
             R2 = np.empty((Na, N), dtype=complex)
 
+        valid_in = kminus_in >= 0
+        valid_out = kplus_out >= 0
         for a in range(Na):
             b = int(partner[a])
+            if b < 0 or abs(weights[a]) == 0:
+                if keep1:
+                    L1[a, :] = 0.0; R1[a, :] = 0.0
+                if keep2:
+                    L2[a, :] = 0.0; R2[a, :] = 0.0
+                continue
             for pin in range(N):
                 p1 = pin
-                p4 = int(kminus_in[pin])
-                if keep1:
-                    L1[a, pin] = gamma_fn(p1, s1, a, sa, p4, s4, b, sb)
-                if keep2:
-                    L2[a, pin] = gamma_fn(p1, s1, b, sb, p4, s4, a, sa)
+                if valid_in[pin]:
+                    p4 = int(kminus_in[pin])
+                    if keep1:
+                        L1[a, pin] = gamma_fn(p1, s1, a, sa, p4, s4, b, sb)
+                    if keep2:
+                        L2[a, pin] = gamma_fn(p1, s1, b, sb, p4, s4, a, sa)
+                else:
+                    if keep1: L1[a, pin] = 0.0
+                    if keep2: L2[a, pin] = 0.0
             for pout in range(N):
                 p2 = pout
-                p3 = int(kplus_out[pout])
-                if keep1:
-                    R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p3, s3)
-                if keep2:
-                    R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p3, s3)
+                if valid_out[pout]:
+                    p3 = int(kplus_out[pout])
+                    if keep1:
+                        R1[a, pout] = gamma_fn(b, sb, p2, s2, a, sa, p3, s3)
+                    if keep2:
+                        R2[a, pout] = gamma_fn(a, sa, p2, s2, b, sb, p3, s3)
+                else:
+                    if keep1: R1[a, pout] = 0.0
+                    if keep2: R2[a, pout] = 0.0
 
         if keep1:
             K += (weights[:, None] * R1).T @ L1

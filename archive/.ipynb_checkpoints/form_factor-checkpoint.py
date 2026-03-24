@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
 
 ArrayLike = Sequence[float]
-SpinLike = Union[str, int]
-PatchSetMap = Mapping[SpinLike, object]
 
 
 @dataclass
@@ -64,6 +62,7 @@ class TemplateFamily:
     basis: np.ndarray  # shape (Npatch, n_basis)
 
     def project_subspace(self, subspace_basis: np.ndarray) -> TemplateProjection:
+        # Orthonormal bases assumed. Score = squared Frobenius norm of overlap matrix / min(dim)
         overlap = self.basis.conjugate().T @ subspace_basis
         basis_dim = int(self.basis.shape[1])
         denom = max(1, min(basis_dim, int(subspace_basis.shape[1])))
@@ -75,24 +74,6 @@ class TemplateFamily:
             coefficients=np.asarray(coeffs, dtype=float),
             basis_dim=basis_dim,
         )
-
-
-def _normalize_spin_label(spin: SpinLike) -> str:
-    s = str(spin).lower()
-    aliases = {
-        "up": "up",
-        "u": "up",
-        "0": "up",
-        "dn": "dn",
-        "down": "dn",
-        "d": "dn",
-        "1": "dn",
-        "s": "S",
-        "t": "T",
-        "rho": "rho",
-        "sz": "sz",
-    }
-    return aliases.get(s, str(spin))
 
 
 def _normalize_columns(mat: np.ndarray, tol: float = 1e-14) -> np.ndarray:
@@ -154,23 +135,6 @@ def _extract_patch_eigvecs(patchset: Any) -> np.ndarray:
     return np.asarray(eigvecs, dtype=complex)
 
 
-def _canonicalize_q_for_patchset(patchset: Any, Q: Optional[ArrayLike]) -> Optional[np.ndarray]:
-    if Q is None:
-        return None
-    if not hasattr(patchset, "b1") or not hasattr(patchset, "b2"):
-        return np.asarray(Q, dtype=float)
-    b1 = np.asarray(patchset.b1, dtype=float)
-    b2 = np.asarray(patchset.b2, dtype=float)
-    B = np.column_stack([b1, b2])
-    uv = np.linalg.solve(B, np.asarray(Q, dtype=float))
-    uv = uv - np.floor(uv)
-    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-    q_can = B @ uv
-    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
-    return q_can
-
-
 def _centered_angles(ks: np.ndarray, Q: Optional[np.ndarray] = None) -> np.ndarray:
     center = np.zeros(2, dtype=float) if Q is None else np.asarray(Q, dtype=float) / 2.0
     rel = ks - center[None, :]
@@ -188,9 +152,15 @@ def default_template_families(
     kernel_name: str,
     Q: Optional[ArrayLike] = None,
 ) -> List[TemplateFamily]:
+    """
+    Build a small, generic template library on patch space.
+
+    This is intentionally generic. It is suitable for unbiased benchmarking
+    and coarse symmetry diagnosis, not for fully reproducing the paper's
+    sublattice-resolved real-space bond order parameters.
+    """
     ks = _extract_patch_positions(patchset)
-    Q = _canonicalize_q_for_patchset(patchset, Q)
-    theta = _centered_angles(ks, Q)
+    theta = _centered_angles(ks, None if Q is None else np.asarray(Q, dtype=float))
     kx = ks[:, 0]
     ky = ks[:, 1]
     ones = np.ones(len(ks), dtype=float)
@@ -201,16 +171,19 @@ def default_template_families(
     fams.append(_orthonormal_family("d", [np.cos(2 * theta), np.sin(2 * theta)]))
     fams.append(_orthonormal_family("f", [np.cos(3 * theta), np.sin(3 * theta)]))
 
+    # Paper-specific Q=0 particle-hole d-wave harmonics [Eq. (3)]
     f_dx2y2 = np.cos(2 * kx) - np.cos(kx) * np.cos(np.sqrt(3.0) * ky)
     f_dxy = np.sqrt(3.0) * np.sin(kx) * np.sin(np.sqrt(3.0) * ky)
     fams.append(_orthonormal_family("paper_d_Q0", [f_dx2y2, f_dxy]))
 
+    # Simple cosine/sine at transfer Q; useful for finite-Q bond-order-like patterns.
     if Q is not None:
         Q = np.asarray(Q, dtype=float)
         phase = ks @ Q
         fams.append(_orthonormal_family("finiteQ_cos_sin", [np.cos(phase), np.sin(phase)]))
 
     if kernel_name.startswith("pp"):
+        # even/odd under polar angle around FS center; crude proxy for Cooper-pair angular momentum
         fams.append(_orthonormal_family("pp_even", [ones, np.cos(2 * theta), np.sin(2 * theta)]))
         fams.append(_orthonormal_family("pp_odd", [np.cos(theta), np.sin(theta), np.cos(3 * theta), np.sin(3 * theta)]))
     else:
@@ -221,97 +194,36 @@ def default_template_families(
 
 class OrderRecognizer:
     """
-    Spin-aware version of the coarse recognizer.
+    Analyze channel-kernel eigensystems and assign generic order labels.
 
-    Backward compatible:
-      - OrderRecognizer(patchset)
-      - OrderRecognizer(patchsets_by_spin={"up": ..., "dn": ...})
+    Scope
+    -----
+    This class sits *after* channel decomposition. It reads a `ChannelKernel`
+    and a compatible `PatchSet`, then
+      1) finds leading eigenmodes / nearly-degenerate subspaces,
+      2) projects them onto generic template families,
+      3) summarizes sublattice weight using patch Bloch eigenvectors.
 
-    The generic symmetry diagnosis still lives in patch space. The only thing we
-    make spin-aware here is: when summarizing sublattice weight, choose the
-    appropriate Bloch eigenvectors for the kernel sector instead of always using a
-    single global patchset.
+    Important limitation
+    --------------------
+    A patch-space kernel alone does not contain the full real-space bond /
+    sublattice-pair tensor structure of the paper's cBO/sBO/f-SC order
+    parameters. Therefore this file should be treated as an *order recognizer*
+    and *symmetry interpreter*, not a full paper-specific bond-order reconstructor.
     """
 
     def __init__(
         self,
-        patchset: Any = None,
+        patchset: Any,
         *,
-        patchsets_by_spin: Optional[PatchSetMap] = None,
-        default_spin: str = "up",
         degeneracy_tol: float = 1e-6,
         projection_threshold: float = 0.20,
     ) -> None:
-        if patchsets_by_spin is None:
-            if patchset is None:
-                raise ValueError("Provide either patchset or patchsets_by_spin.")
-            patchsets_by_spin = {default_spin: patchset}
-        elif patchset is not None:
-            raise ValueError("Provide patchset or patchsets_by_spin, not both.")
-
-        self.patchsets_by_spin: Dict[str, Any] = {
-            _normalize_spin_label(k): v for k, v in patchsets_by_spin.items()
-        }
-        if len(self.patchsets_by_spin) == 0:
-            raise ValueError("patchsets_by_spin is empty.")
-
-        self.default_spin = _normalize_spin_label(default_spin)
-        if self.default_spin not in self.patchsets_by_spin:
-            self.default_spin = next(iter(self.patchsets_by_spin.keys()))
-
-        self.patchset = self.patchsets_by_spin[self.default_spin]
-        self.ks = _extract_patch_positions(self.patchset)
-        self.eigvecs = _extract_patch_eigvecs(self.patchset)
-        self.ks_by_spin: Dict[str, np.ndarray] = {}
-        self.eigvecs_by_spin: Dict[str, np.ndarray] = {}
-        self._validate_patchsets()
-
+        self.patchset = patchset
+        self.ks = _extract_patch_positions(patchset)
+        self.eigvecs = _extract_patch_eigvecs(patchset)
         self.degeneracy_tol = float(degeneracy_tol)
         self.projection_threshold = float(projection_threshold)
-
-    def _validate_patchsets(self) -> None:
-        ref_ks = None
-        ref_npatch = None
-        for spin, ps in self.patchsets_by_spin.items():
-            ks = _extract_patch_positions(ps)
-            eig = _extract_patch_eigvecs(ps)
-            self.ks_by_spin[spin] = ks
-            self.eigvecs_by_spin[spin] = eig
-            if ref_ks is None:
-                ref_ks = ks
-                ref_npatch = ks.shape[0]
-            else:
-                if ks.shape[0] != ref_npatch:
-                    raise ValueError("All spin patchsets used by Benchmark2 must have the same Npatch.")
-                if ks.shape == ref_ks.shape and not np.allclose(ks, ref_ks, atol=1e-10, rtol=0.0):
-                    raise ValueError(
-                        "Benchmark2 assumes all spin sectors share the same patch representatives in momentum space. "
-                        "Their Bloch eigenvectors may differ, but the patch coordinates must match."
-                    )
-
-    def _get_patchset_for_spin(self, spin: SpinLike):
-        key = _normalize_spin_label(spin)
-        if key in self.patchsets_by_spin:
-            return self.patchsets_by_spin[key]
-        if self.default_spin in self.patchsets_by_spin:
-            return self.patchsets_by_spin[self.default_spin]
-        return next(iter(self.patchsets_by_spin.values()))
-
-    def _get_eigvecs_for_spin(self, spin: SpinLike) -> np.ndarray:
-        ps = self._get_patchset_for_spin(spin)
-        return _extract_patch_eigvecs(ps)
-
-    def _primary_physical_spin_for_kernel(self, kernel: Any) -> str:
-        # Prefer explicit kernel metadata from channels.py over name heuristics.
-        if hasattr(kernel, "col_spins"):
-            for s in kernel.col_spins:
-                key = _normalize_spin_label(s)
-                if key in {"up", "dn"}:
-                    return key
-        name = getattr(kernel, "name", "").lower()
-        if "dd" in name or "dn" in name:
-            return "dn"
-        return self.default_spin
 
     def _sorted_eigensystem(self, kernel: Any, sort_by: str = "abs") -> Tuple[np.ndarray, np.ndarray]:
         vals, vecs = kernel.eig(sort_by=sort_by)
@@ -364,11 +276,10 @@ class OrderRecognizer:
             weight = weight / total
         return np.asarray(weight, dtype=float)
 
-    def _sublattice_weights(self, kernel: Any, patch_weight: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[int]]:
-        eigvecs = self._get_eigvecs_for_spin(self._primary_physical_spin_for_kernel(kernel))
-        if eigvecs.size == 0:
+    def _sublattice_weights(self, patch_weight: np.ndarray) -> Tuple[Optional[np.ndarray], Optional[int]]:
+        if self.eigvecs.size == 0:
             return None, None
-        orb_w = np.abs(eigvecs) ** 2
+        orb_w = np.abs(self.eigvecs) ** 2
         if orb_w.ndim != 2:
             return None, None
         if orb_w.shape[0] != patch_weight.shape[0]:
@@ -381,10 +292,8 @@ class OrderRecognizer:
         return np.asarray(weights, dtype=float), dominant
 
     def _partner_parity(self, kernel: Any, vec: np.ndarray) -> Optional[float]:
+        # For pp kernels, compare v(p_partner) with ±v(p)
         if not hasattr(kernel, "col_partner_patches"):
-            return None
-        if getattr(kernel, "name", "").lower() in {"pp_singlet_sz0", "pp_triplet_sz0"}:
-            # For mixed-spin pair kernels, patch-space parity alone is not a clean proxy.
             return None
         partner = np.asarray(kernel.col_partner_patches, dtype=int)
         if partner.shape[0] != vec.shape[0]:
@@ -394,6 +303,7 @@ class OrderRecognizer:
         if denom < 1e-14:
             return None
         overlap = np.vdot(vec, vp) / denom
+        # For ideal even parity: +1, odd parity: -1
         return float(np.real(overlap))
 
     def _paper_notes(
@@ -438,15 +348,14 @@ class OrderRecognizer:
         analyses: List[ModeAnalysis] = []
         for group in groups:
             subspace = self._subspace_basis(vecs, group)
-            Q_can = _canonicalize_q_for_patchset(self.patchset, np.asarray(kernel.Q, dtype=float))
-            projections = self._template_projections(subspace, kernel.name, Q_can, template_families)
+            projections = self._template_projections(subspace, kernel.name, np.asarray(kernel.Q, dtype=float), template_families)
             dominant = projections[0] if projections else TemplateProjection("unclassified", 0.0, np.zeros(0), 0)
             patch_weight = self._patch_weight(subspace)
-            sublat_w, dominant_sublat = self._sublattice_weights(kernel, patch_weight)
+            sublat_w, dominant_sublat = self._sublattice_weights(patch_weight)
             partner_parity = None
             if kernel.name.startswith("pp") and subspace.shape[1] >= 1:
                 partner_parity = self._partner_parity(kernel, subspace[:, 0])
-            notes = self._paper_notes(kernel.name, Q_can, projections, subspace.shape[1])
+            notes = self._paper_notes(kernel.name, np.asarray(kernel.Q, dtype=float), projections, subspace.shape[1])
             if dominant.score < self.projection_threshold:
                 notes.append("No template family has strong overlap; keep this mode as numerically discovered / potentially novel.")
                 dominant_label = "unclassified"
@@ -455,7 +364,7 @@ class OrderRecognizer:
             analyses.append(
                 ModeAnalysis(
                     kernel_name=kernel.name,
-                    Q=np.asarray(Q_can, dtype=float),
+                    Q=np.asarray(kernel.Q, dtype=float),
                     eigenvalues=np.asarray(vals[group]),
                     basis_vectors=subspace,
                     subspace_dim=int(subspace.shape[1]),
@@ -490,7 +399,4 @@ __all__ = [
     "TemplateFamily",
     "TemplateProjection",
     "default_template_families",
-    "_canonicalize_q_for_patchset",
-    "_extract_patch_eigvecs",
-    "_extract_patch_positions",
 ]

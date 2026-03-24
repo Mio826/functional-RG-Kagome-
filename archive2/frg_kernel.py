@@ -102,6 +102,33 @@ def available_internal_spin_pairs(patchsets: PatchSetMap):
     return out
 
 
+
+
+def _reduced_coords(k: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
+    B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
+    return np.linalg.solve(B, np.asarray(k, dtype=float))
+
+
+def _wrap_reduced_coords_unit(uv: np.ndarray) -> np.ndarray:
+    """Map reduced coordinates to the unique half-open cell [0, 1)."""
+    uv = np.asarray(uv, dtype=float)
+    uv = uv - np.floor(uv)
+    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+    return uv
+
+
+def canonicalize_q_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
+    """Canonicalize momentum transfer q modulo reciprocal lattice vectors using a unique [0,1) reduced-cell representative."""
+    ref_spin = 'up' if has_patchset(patchsets, 'up') else 'dn'
+    ps = patchset_for_spin(patchsets, ref_spin)
+    B = np.column_stack([np.asarray(ps.b1, dtype=float), np.asarray(ps.b2, dtype=float)])
+    uv = np.linalg.solve(B, np.asarray(q, dtype=float))
+    uv = _wrap_reduced_coords_unit(uv)
+    q_can = B @ uv
+    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
+    return q_can
+
 def _minimum_image_displacement(k_target: Sequence[float], k_ref: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
     k_target = np.asarray(k_target, dtype=float)
     k_ref = np.asarray(k_ref, dtype=float)
@@ -133,7 +160,7 @@ def find_shifted_patch_index(patchsets: PatchSetMap, spin: SpinLike, target_k: S
 
 def shifted_patch_map(patchsets: PatchSetMap, spin: SpinLike, Q: Sequence[float], mode: str) -> Tuple[np.ndarray, np.ndarray]:
     ps = patchset_for_spin(patchsets, spin)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     idxs = np.zeros(ps.Npatch, dtype=int)
     residuals = np.zeros(ps.Npatch, dtype=float)
 
@@ -278,7 +305,7 @@ def compute_pp_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -352,7 +379,7 @@ def compute_ph_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -435,7 +462,7 @@ def compute_phc_kernel(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1
@@ -518,7 +545,7 @@ def compute_pp_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -592,7 +619,7 @@ def compute_ph_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -684,7 +711,7 @@ def compute_phc_kernel_fast(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1
@@ -895,7 +922,7 @@ def compute_pp_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s1, s2
@@ -981,7 +1008,7 @@ def compute_ph_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s3 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s4, s2 = s1, s3
@@ -1089,7 +1116,7 @@ def compute_phc_kernel_fast2(
         raise ValueError("config must be provided")
     gamma_fn = build_gamma_accessor(gamma)
     allowed = _normalize_allowed_spin_blocks(allowed_spin_blocks)
-    Q = np.asarray(Q, dtype=float)
+    Q = canonicalize_q_for_patchsets(patchsets, Q)
     s1, s2 = map(normalize_spin, incoming_spins)
     if outgoing_spins is None:
         s3, s4 = s2, s1

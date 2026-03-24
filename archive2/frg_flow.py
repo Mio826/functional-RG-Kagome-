@@ -132,11 +132,23 @@ def _wrap_reduced_coords_centered(uv: np.ndarray) -> np.ndarray:
     return uv - np.floor(uv + 0.5)
 
 
+def _wrap_reduced_coords_unit(uv: np.ndarray) -> np.ndarray:
+    """Map reduced coordinates to the unique half-open cell [0, 1)."""
+    uv = np.asarray(uv, dtype=float)
+    uv = uv - np.floor(uv)
+    # Guard against 1.0 introduced by floating roundoff on BZ boundaries
+    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+    return uv
+
+
 def _canonicalize_q(q: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
-    uv = _reduced_coords(np.asarray(q, dtype=float), b1, b2)
-    uv = _wrap_reduced_coords_centered(uv)
     B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
-    return B @ uv
+    uv = np.linalg.solve(B, np.asarray(q, dtype=float))
+    uv = _wrap_reduced_coords_unit(uv)
+    q_can = B @ uv
+    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
+    return q_can
 
 
 class TransferGrid:
@@ -156,7 +168,7 @@ class TransferGrid:
 
     def key(self, q: Sequence[float]) -> Tuple[float, float]:
         uv = _reduced_coords(self.canonicalize(q), self.b1, self.b2)
-        uv = _wrap_reduced_coords_centered(uv)
+        uv = _wrap_reduced_coords_unit(uv)
         return tuple(np.round(uv, decimals=self.decimals))
 
     def nearest_index(self, q: Sequence[float]) -> int:
@@ -168,7 +180,7 @@ class TransferGrid:
         return int(np.argmin(dists))
 
 
-def build_unique_q_listdef build_unique_q_list(patchsets: PatchSetMap, *, mode: str, decimals: int = 10) -> List[np.ndarray]:
+def build_unique_q_list(patchsets: PatchSetMap, *, mode: str, decimals: int = 10) -> List[np.ndarray]:
     ref_spin = available_physical_spins(patchsets)[0]
     ps = patchset_for_spin(patchsets, ref_spin)
     ks = np.asarray([p.k_cart for p in ps.patches], dtype=float)

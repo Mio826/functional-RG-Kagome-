@@ -154,23 +154,6 @@ def _extract_patch_eigvecs(patchset: Any) -> np.ndarray:
     return np.asarray(eigvecs, dtype=complex)
 
 
-def _canonicalize_q_for_patchset(patchset: Any, Q: Optional[ArrayLike]) -> Optional[np.ndarray]:
-    if Q is None:
-        return None
-    if not hasattr(patchset, "b1") or not hasattr(patchset, "b2"):
-        return np.asarray(Q, dtype=float)
-    b1 = np.asarray(patchset.b1, dtype=float)
-    b2 = np.asarray(patchset.b2, dtype=float)
-    B = np.column_stack([b1, b2])
-    uv = np.linalg.solve(B, np.asarray(Q, dtype=float))
-    uv = uv - np.floor(uv)
-    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-    q_can = B @ uv
-    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
-    return q_can
-
-
 def _centered_angles(ks: np.ndarray, Q: Optional[np.ndarray] = None) -> np.ndarray:
     center = np.zeros(2, dtype=float) if Q is None else np.asarray(Q, dtype=float) / 2.0
     rel = ks - center[None, :]
@@ -189,8 +172,7 @@ def default_template_families(
     Q: Optional[ArrayLike] = None,
 ) -> List[TemplateFamily]:
     ks = _extract_patch_positions(patchset)
-    Q = _canonicalize_q_for_patchset(patchset, Q)
-    theta = _centered_angles(ks, Q)
+    theta = _centered_angles(ks, None if Q is None else np.asarray(Q, dtype=float))
     kx = ks[:, 0]
     ky = ks[:, 1]
     ones = np.ones(len(ks), dtype=float)
@@ -438,15 +420,14 @@ class OrderRecognizer:
         analyses: List[ModeAnalysis] = []
         for group in groups:
             subspace = self._subspace_basis(vecs, group)
-            Q_can = _canonicalize_q_for_patchset(self.patchset, np.asarray(kernel.Q, dtype=float))
-            projections = self._template_projections(subspace, kernel.name, Q_can, template_families)
+            projections = self._template_projections(subspace, kernel.name, np.asarray(kernel.Q, dtype=float), template_families)
             dominant = projections[0] if projections else TemplateProjection("unclassified", 0.0, np.zeros(0), 0)
             patch_weight = self._patch_weight(subspace)
             sublat_w, dominant_sublat = self._sublattice_weights(kernel, patch_weight)
             partner_parity = None
             if kernel.name.startswith("pp") and subspace.shape[1] >= 1:
                 partner_parity = self._partner_parity(kernel, subspace[:, 0])
-            notes = self._paper_notes(kernel.name, Q_can, projections, subspace.shape[1])
+            notes = self._paper_notes(kernel.name, np.asarray(kernel.Q, dtype=float), projections, subspace.shape[1])
             if dominant.score < self.projection_threshold:
                 notes.append("No template family has strong overlap; keep this mode as numerically discovered / potentially novel.")
                 dominant_label = "unclassified"
@@ -455,7 +436,7 @@ class OrderRecognizer:
             analyses.append(
                 ModeAnalysis(
                     kernel_name=kernel.name,
-                    Q=np.asarray(Q_can, dtype=float),
+                    Q=np.asarray(kernel.Q, dtype=float),
                     eigenvalues=np.asarray(vals[group]),
                     basis_vectors=subspace,
                     subspace_dim=int(subspace.shape[1]),
@@ -490,7 +471,6 @@ __all__ = [
     "TemplateFamily",
     "TemplateProjection",
     "default_template_families",
-    "_canonicalize_q_for_patchset",
     "_extract_patch_eigvecs",
     "_extract_patch_positions",
 ]
