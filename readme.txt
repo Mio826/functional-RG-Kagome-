@@ -1,22 +1,23 @@
 I am building a functional RG (fRG) pipeline for kagome lattice systems.
 
 🎯 **Ultimate goal**
-- Reproduce the phase diagram in the PRL paper on kagome Hubbard model (van Hove filling)
-- Identify leading instabilities (FM, PI, cBO, sBO, f-SC, etc.)
-- Then extend the pipeline to study modified models:
+- Reproduce the PRL phase diagram of the kagome Hubbard model (van Hove filling)
+- Identify leading instabilities:
+    FM, PI, cBO, sBO, f-SC, etc.
+- Extend to modified models:
     - flux patterns
-    - SOC (e.g. Rashba)
-    - different interaction structures
+    - spin-orbit coupling (e.g. Rashba)
+    - generalized interaction structures
 
-So this is both:
-- a **reproduction project**
+This project is both:
+- a **benchmark reproduction**
 - and a **general-purpose fRG framework**
 
 --------------------------------------------------
 
-🧠 **Current pipeline structure (4 modules)**
+🧠 **Pipeline structure (4 modules)**
 
-The whole pipeline is modular and follows the standard fRG logic (Metzner RMP, one-loop truncation).
+The pipeline follows standard one-loop fRG (Metzner RMP), implemented in a modular way.
 
 ----------------------------------------
 
@@ -27,52 +28,53 @@ Defines the microscopic system and prepares the initial vertex.
 Includes:
 
 1. Non-interacting model
-   - Tight-binding Hamiltonian (kagome, possibly spinful)
+   - Kagome tight-binding Hamiltonian
    - Supports flux / SOC extensions
    - Computes:
         eigenvalues ε(k)
         eigenvectors u(k)
 
 2. Interaction (extended Hubbard)
-   - Bare interaction in orbital basis
-   - Projection to band basis via Bloch eigenstates
+   - Defined in orbital basis
+   - Projected to band basis via Bloch eigenvectors
    - Produces antisymmetrized vertex:
         Γ(k1,k2,k3,k4)
 
 3. Fermi surface patching
    - Discretizes FS into patches
    - Stores:
-        patch momenta
-        Bloch eigenvectors
-   - Spin-aware patch sets (up/down handled explicitly)
+        patch momenta k_i
+        Bloch eigenvectors u(k_i)
+   - Spin-resolved patch sets (up/down treated explicitly)
 
-4. Channel decomposition (bookkeeping layer)
+4. Channel decomposition (index backbone)
    - Converts Γ into:
         pp / ph / ph' channel matrices
    - Defines:
         momentum routing conventions
-        patch index mapping (Q ± k → nearest patch)
+        mapping between patch indices and transfer momentum Q
 
 IMPORTANT:
-- This module defines the **index conventions of the vertex**
-- Everything downstream depends on this
+- This module defines **all index conventions**
+- Any inconsistency here propagates through the entire pipeline
 
 ----------------------------------------
 
-### Module 2: Order diagnosis (output layer)
+### Module 2: Order diagnosis (analysis layer)
 
-Analyzes a given vertex or channel kernel.
+Analyzes channel kernels during the flow.
 
 Two levels:
 
 1. Form factor analysis
    - Diagonalizes channel kernels
    - Extracts leading eigenmodes
-   - Handles degeneracy
-   - Classifies symmetry (s, p, d, f, etc.)
+   - Handles degeneracies
+   - Classifies symmetry:
+        s, p, d, f, etc.
 
 2. Kagome-specific diagnosis
-   - Reconstructs internal tensor structure:
+   - Reconstructs internal order tensors:
         Φ (particle-hole)
         Δ (particle-particle)
    - Matches against known kagome orders:
@@ -82,101 +84,143 @@ Two levels:
 
 ----------------------------------------
 
-### Module 3: One-loop kernel
+### Module 3: One-loop kernel (physics core)
 
 Implements the fRG flow equation (Metzner Eq. 52).
 
 Includes:
 
-- Temperature cutoff scheme
+- Temperature-flow cutoff
 - Propagators:
     G (full)
     S (single-scale)
 
-- Three one-loop contributions:
+- Three channels:
     particle-particle (pp)
     particle-hole direct (ph)
     particle-hole crossed (ph')
+
+Key implementation:
+
+- Internal loops evaluated in patch basis
+- Momentum conservation enforced via patch mapping
+- Vectorized Matsubara summation (performance-critical)
 
 Outputs:
     dΓ/dT in channel representation
 
 ----------------------------------------
 
-### Module 4: RG flow (current focus)
+### Module 4: RG flow (orchestration layer)
 
-Combines everything into an actual flow.
+Drives the full flow.
 
-Key design:
+Representation:
 
-- Vertex stored in channel form:
     Γ = Γ_bare + Φ_pp + Φ_phd + Φ_phc
 
-- Avoids full Γ(p1,p2,p3,p4) tensor (O(Np^4))
-- Uses:
-    transfer momentum grids (Q)
-    patch representation
+Design choices:
+
+- Avoid full Γ(p1,p2,p3,p4) tensor (O(Np^4))
+- Work in channel representation:
+    O(NQ · Np^2)
 
 Flow procedure:
 
 1. Initialize Γ_bare
-2. At each step:
-    - compute RHS via one-loop kernel
+2. For each temperature step:
+    - compute RHS (one-loop kernel)
     - update channel corrections
 3. Periodically:
-    - reconstruct vertex
+    - reconstruct vertex (via accessor)
     - run order diagnosis
 4. Detect instability via:
-    - divergence of eigenvalues
+    - leading eigenvalue growth
 
 ----------------------------------------
 
-🧩 **How modules interact**
+🧩 **Momentum structure (CRITICAL DESIGN)**
+
+This pipeline uses a **patch-driven definition of transfer momentum Q**:
+
+- Q is NOT externally imposed
+- Q is generated from patch combinations:
+    pp:  Q = k1 + k2
+    ph:  Q = k3 - k1
+
+- All Q values are:
+    - canonicalized modulo reciprocal lattice vectors
+    - indexed via transfer grids
+
+- Channel storage is organized by:
+    (spin block, Q index, patch indices)
+
+----------------------------------------
+
+🚨 **Key consistency requirement (recently fixed)**
+
+Physical invariance:
+
+    Q ≡ Q + G   (G: reciprocal lattice vector)
+
+must hold exactly.
+
+Implementation details:
+
+- All Q are canonicalized in reciprocal space
+- Partner patch mapping is constrained by:
+    fixed transfer index (iq)
+- No free "nearest patch" mapping across different Q sectors
+- External and internal legs use the SAME Q definition
+
+This avoids:
+
+- artificial Q-dependence
+- unphysical divergence
+- incorrect order diagnosis
+
+----------------------------------------
+
+🧠 **How modules interact**
 
 - Module 1 → provides:
-    patchsets, bare interaction, Γ_bare
+    patchsets, Γ_bare
 
-- Module 3 → uses:
-    patchsets + Γ (via accessor)
-    to compute RHS
+- Module 3 → computes:
+    dΓ/dT from current Γ
 
-- Module 4 → orchestrates:
-    flow loop and state update
+- Module 4 → updates:
+    channel representation of Γ
 
 - Module 2 → analyzes:
-    intermediate Γ during flow
+    channel kernels at selected steps
 
 ----------------------------------------
 
-🚨 **Important implementation details**
+⚙️ **Current approximation level**
 
-- Spin is explicitly treated (spinful system)
-- Only spin-conserving processes are kept
-- Channel representation is used for scalability:
-    reduces O(Np^4) → O(NQ · Np^2)
+- One-loop fRG
+- Temperature-flow cutoff
+- Static vertex (no frequency dependence)
+- No self-energy flow
 
-- Momentum conservation handled via patch mapping
-- Transfer momentum Q is discretized
+Vertex structure:
 
---------------------------------------------------
+- Stored in reduced channel form
+- Only 6 spin-conserving spin blocks retained
+- Forbidden spin sectors set to zero
 
-IMPORTANT:
-- Do not give generic explanations
-- Always connect to my pipeline structure
-- Be precise about:
-    indices, channels, momentum routing, spin structure
+Momentum treatment:
 
---------------------------------------------------
-Current approximation level
+- Patch discretization on FS
+- Transfer momenta discretized from patch combinations
+- All momenta treated modulo reciprocal lattice vectors
 
-static one-loop temperature-flow fRG
+----------------------------------------
 
-no self-energy flow yet
+📌 **Notes**
 
-no frequency dependence of the two-particle vertex
-
-vertex stored in reduced channel form with 6 allowed spin-conserving spin blocks
-
-forbidden spin blocks are treated as zero
-
-transfer momenta and shifted legs are patch-discretized via nearest-patch matching modulo reciprocal lattice vectors
+- Spin is treated explicitly
+- Momentum routing is fixed and consistent across modules
+- The pipeline is designed for:
+    correctness first → then performance → then extensibility
