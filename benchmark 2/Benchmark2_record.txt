@@ -1,435 +1,264 @@
-Benchmark 2 Record
-==================
+I am building a functional RG (fRG) pipeline for kagome lattice systems.
 
-Scope
------
-Benchmark 2 validates the two new post-channel-analysis layers added after Benchmark 1:
+🎯 **Ultimate goal**
+- Reproduce the PRL phase diagram of the kagome Hubbard model (van Hove filling)
+- Identify leading instabilities:
+    FM, PI, cBO, sBO, f-SC, etc.
+- Extend to modified models:
+    - flux patterns
+    - spin-orbit coupling (e.g. Rashba)
+    - generalized interaction structures
 
-1. `form_factor.py`
-2. `kagome_order_diagnosis.py`
+This project is both:
+- a **benchmark reproduction**
+- and a **general-purpose fRG framework**
 
-These files are not replacements for the earlier modules. They sit on top of the existing
-pipeline:
+--------------------------------------------------
 
-    noninteracting -> patching -> interaction -> channels -> form_factor -> kagome_order_diagnosis
+🧠 **Pipeline structure (4 modules)**
 
-The purpose of Benchmark 2 is to check that, once a channel kernel is available, we can
+The pipeline follows standard one-loop fRG (Metzner RMP), implemented in a modular way.
 
-- extract the leading eigenspace robustly,
-- assign a coarse symmetry/family label in patch space,
-- reconstruct the leading mode into an internal-index tensor using patch Bloch eigenvectors,
-- diagnose Kagome-paper-style orders (FM, PI, cBO, sBO, f-SC),
-- and still leave an explicit `unclassified / novel_candidate` exit for future models.
-
-Files covered
--------------
-1. `form_factor.py`
-2. `kagome_order_diagnosis.py`
-
-Design intent of the two files
-------------------------------
-
-A. `form_factor.py`
-~~~~~~~~~~~~~~~~~~~
-Role:
-- Read a `ChannelKernel`.
-- Diagonalize the kernel and identify the leading eigenspace.
-- Group nearly degenerate leading eigenvalues into one subspace.
-- Project that eigenspace onto a small generic template library.
-
-This layer is intentionally generic and model-agnostic.
-
-Main mathematical object:
-- For a given channel kernel K, solve
-
-      sum_{p'} K_{p,p'} phi(p') = lambda phi(p)
-
-- The leading eigenvector / eigenspace is interpreted as the dominant patch-space collective mode.
-
-What it returns:
-- leading eigenspace dimension,
-- coarse label such as `s`, `d`, `f`, `finiteQ_cos_sin`, `pp_odd`, etc.,
-- simple sublattice-weight summary from patch Bloch eigenvectors,
-- parity proxy for pp kernels from partner-patch comparison,
-- diagnostic notes.
-
-Important limitation:
-- This layer works in patch space.
-- It is sufficient for coarse symmetry analysis, but it does not yet reconstruct the
-  full multisublattice order parameter used in the Kagome PRL.
-
-B. `kagome_order_diagnosis.py`
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Role:
-- Take the leading mode returned by the coarse recognizer.
-- Reconstruct it into an internal-index tensor using patch Bloch eigenvectors.
-- Compare the reconstructed tensor against Kagome-paper-specific templates.
-- Return a paper-style label if the match is strong enough.
-- Otherwise return `unclassified` and mark it as a possible novel candidate.
-
-Main reconstruction formulas:
-- particle-hole channel:
-
-      Phi_{l n}(p;Q) ~ g(p) * u_l^*(k_p) * u_n(k_{p_Q})
-
-- particle-particle channel:
-
-      Delta_{m n}(p) ~ g(p) * u_m(k_p) * u_n(k_{p_partner})
-
-where
-- g(p) is the leading patch-space mode,
-- u(k) is the Bloch eigenvector stored in the patch set.
-
-This layer therefore translates
-- "where in momentum space the mode is strong"
-into
-- "which sublattice pairs carry the order".
-
-Returned internal summaries include:
-- reconstructed tensor basis,
-- pair-weight matrix,
-- dominant sublattice pair,
-- same-sublattice weight,
-- inter-sublattice weight,
-- paper label,
-- recognition status (`recognized` or `novel_candidate`).
-
-Benchmark notebooks and evolution
----------------------------------
-Benchmark 2 was developed in stages.
-
-1. `benchmark2_order_recognition.ipynb`
-   - unit tests for the coarse recognizer only.
-
-2. `benchmark2_kagome_order_diagnosis.ipynb`
-   - first paper-diagnosis attempt.
-   - result: PI and FM could be recognized, but cBO / sBO / f-SC were not yet robustly
-     recognized.
-   - this exposed that patch-space scalar harmonics alone were not enough for the
-     multisublattice Kagome orders.
-
-3. `benchmark2_internal_mode_reconstruction.ipynb`
-   - upgraded benchmark for the current design.
-   - this notebook tests the explicit internal tensor reconstruction and the updated
-     diagnosis logic.
-   - this is the benchmark that should be regarded as the successful final Benchmark 2.
-
-What was tested in the final Benchmark 2
 ----------------------------------------
-The final notebook tests six synthetic cases. These are controlled unit-test modes rather than
-full FRG outputs. The goal is to validate the logic of the reconstruction/diagnosis layer before
-feeding it real RG data.
-
-Case 1: PI
-~~~~~~~~~~
-Construction:
-- channel: `ph_charge`
-- Q = 0
-- patch-space mode: d-wave doublet
-- patch Bloch eigenvectors chosen so that the signal is diagonal / same-sublattice
-
-Expected behavior:
-- recognized as `PI`
-- dominant pair = (A, A)
-- same-sublattice weight dominant
-
-Case 2: cBO
-~~~~~~~~~~~
-Construction:
-- channel: finite-Q particle-hole charge sector
-- one-Q bond-order-like patch mode
-- patch Bloch structure chosen to emphasize an off-diagonal B-C bond component
-
-Expected behavior:
-- recognized as `cBO`
-- dominant pair = (B, C)
-- inter-sublattice weight dominant
-
-Case 3: sBO
-~~~~~~~~~~~
-Construction:
-- same spatial structure as cBO
-- spin-like particle-hole channel
-
-Expected behavior:
-- recognized as `sBO`
-- dominant pair = (B, C)
-- inter-sublattice weight dominant
-
-Case 4: f-SC
-~~~~~~~~~~~~
-Construction:
-- pp triplet / odd sector
-- patch Bloch structure chosen to emphasize A-B inter-sublattice pairing
-
-Expected behavior:
-- recognized as `f-SC`
-- dominant pair = (A, B)
-- inter-sublattice weight dominant
-
-Case 5: FM
-~~~~~~~~~~
-Construction:
-- Q = 0
-- spin-like particle-hole constant mode
-- diagonal / same-sublattice signal
-
-Expected behavior:
-- recognized as `FM`
-
-Case 6: novel_pp_dwave
-~~~~~~~~~~~~~~~~~~~~~~
-Construction:
-- pp singlet d-wave-like mode
-- physically reasonable but intentionally outside the five Kagome PRL labels
-
-Expected behavior:
-- should NOT be forced into FM / PI / cBO / sBO / f-SC
-- should return `paper_label = "unclassified"`
-- should return `recognition_status = "novel_candidate"`
-
-Final observed outcome
-----------------------
-From the successful final Benchmark 2 run (`benchmark2_internal_mode_reconstruction.ipynb`),
-the six cases behaved as intended:
-
-- PI -> `PI` / `recognized`
-- cBO -> `cBO` / `recognized`
-- sBO -> `sBO` / `recognized`
-- fSC -> `f-SC` / `recognized`
-- FM -> `FM` / `recognized`
-- novel_pp_dwave -> `unclassified` / `novel_candidate`
-
-The notebook assertions all passed.
-
-What this shows architecturally
--------------------------------
-1. The earlier modules from Benchmark 1 do NOT need to be rewritten.
-   The current outputs of
-   - patching
-   - interaction
-   - channels
-   are sufficient to support the new post-processing layer.
-
-2. `form_factor.py` remains necessary.
-   It provides the leading eigenspace, coarse symmetry family, degeneracy handling,
-   and partner-parity information.
-   This is the correct generic layer between `channels.py` and any model-specific diagnosis.
-
-3. `kagome_order_diagnosis.py` is a second, more specific layer.
-   It reconstructs the leading patch mode into an internal Kagome tensor and assigns
-   a paper-style physical label only if the evidence is strong enough.
-
-4. The new design explicitly leaves room for future models.
-   The `unclassified / novel_candidate` output is not a failure mode.
-   It is an intentional safety feature that prevents new physics from being forced into
-   the five labels of the 2013 Kagome PRL.
-
-Current limitations
--------------------
-Benchmark 2 validates the logic of the diagnosis layer, but not the full FRG physics yet.
-
-In particular:
-- The benchmark uses synthetic kernels / synthetic patch modes, not temperature-flow-renormalized
-  FRG vertices.
-- cBO/sBO are currently diagnosed as one-Q components; the full three-Q superposition and 12-site
-  real-space pattern are a later layer.
-- Real-space bond-distance identification (e.g. explicit second-neighbor vs third-neighbor
-  reconstruction from real FRG output) is not yet part of the current benchmark.
-
-Practical conclusion
---------------------
-Benchmark 2 is successful.
-
-It shows that the project now has a complete post-channel-analysis chain:
-
-    Channel kernel
-        -> coarse eigenspace / form-factor analysis
-        -> internal mode reconstruction
-        -> Kagome order diagnosis
-        -> optional novel-candidate exit
-
-This means the codebase is ready for the next stage:
-- integrating temperature-cutoff RG flow,
-- generating renormalized kernels from the actual FRG solver,
-- and then feeding those kernels into the already-benchmarked diagnosis stack.
-
-
-Benchmark 2 Spin-Aware Addendum
-===============================
-
-Scope of this addendum
-----------------------
-This addendum records the follow-up benchmark performed after upgrading
-`form_factor.py` and `kagome_order_diagnosis.py` from a single-patchset design
-to a spin-aware design.
-
-Why the upgrade was needed
---------------------------
-The original Benchmark 2 logic assumed that one patch set was enough for all
-reconstruction steps. That assumption is acceptable only when
-
-- the model is spin-degenerate, or
-- the analysis is restricted to a single spin block whose Bloch eigenvectors are
-  the same objects used everywhere.
-
-For the present project this is too restrictive. The intended models generally
-preserve S_z, so spin blocks do not mix, but the up-spin and down-spin sectors
-may nevertheless have different Bloch eigenvectors and even different patch
-representatives. In that situation, the old Benchmark 2 code could still attach
-labels such as `charge`, `spin`, `singlet`, or `triplet` from the kernel name,
-but its internal tensor reconstruction still used only one patch Bloch basis.
-That was the logical weakness that had to be fixed.
-
-What was changed
-----------------
-1. `form_factor.py`
-   - upgraded to accept `patchsets_by_spin={"up": ..., "dn": ...}` while
-     retaining backward compatibility with the old single-patchset usage.
-   - the recognizer still remains the generic, patch-space layer.
-   - it now has access to spin-resolved patch Bloch data when needed.
-
-2. `kagome_order_diagnosis.py`
-   - upgraded to accept the same `patchsets_by_spin` structure.
-   - internal tensor reconstruction is no longer forced to use one universal
-     `eigvecs` array.
-   - the code now routes the two legs of the reconstructed mode to the proper
-     spin-resolved Bloch bases, e.g.
-         up-up,
-         dn-dn,
-         up-dn.
-   - the diagnosis output now explicitly records `leg_spin_structure`.
-
-Architectural meaning of the new Benchmark 2
---------------------------------------------
-With this upgrade, the post-channel-analysis stack becomes
-
-    channels
-        -> form_factor (generic leading-mode recognition)
-        -> kagome_order_diagnosis (spin-aware internal reconstruction)
-        -> paper-style order label or novel-candidate exit
-
-The spin organization is therefore now split cleanly across layers:
-
-- `channels.py`
-  still builds the relevant spin blocks (`uu`, `dd`, `ud`, `du`) and combines
-  them into physical kernels such as longitudinal charge/spin or
-  singlet/triplet S_z=0.
-
-- `form_factor.py`
-  reads a single already-built channel kernel and determines its dominant
-  patch-space eigenspace / symmetry family.
-
-- `kagome_order_diagnosis.py`
-  takes that leading patch mode and reconstructs the internal-index tensor using
-  the correct spin-resolved Bloch eigenvectors for the two legs.
-
-This is the correct division of responsibilities.
-
-What the spin-aware notebook tested
------------------------------------
-The new notebook `benchmark2_spinaware_test.ipynb` was not designed as a full
-FRG-physics test. It was designed as a logic test for spin routing.
-
-Synthetic patch sets were constructed for two spin sectors:
-
-- one `patchset_up`
-- one `patchset_dn`
-
-with deliberately different Bloch eigenvectors. This is important: if the two
-spin sectors had identical eigvecs, the old and new reconstruction logic could
-appear to agree by accident.
-
-Synthetic kernels were then used to test several representative sectors:
-
-1. `pp_singlet_sz0`
-   - expected to use the pair of spin bases (`up`, `dn`)
-
-2. `ph_charge_longitudinal`
-   - built from longitudinal particle-hole information
-   - expected to route through spin-resolved reconstruction rather than one
-     universal basis
-
-3. `ph_spin_longitudinal`
-   - same comment as above, but in the spin-like longitudinal sector
-
-4. `triplet_uu`
-   - expected to remain a same-spin reconstruction using (`up`, `up`)
-
-Observed notebook output
-------------------------
-The notebook printed the following key structural outcomes:
-
-- `pp_singlet_sz0`
-  -> leg spin structure = (`up`, `dn`)
-  -> dominant pair = (1, 2)
-  -> same/inter weight = 0.0 / 1.0
-
-- `ph_charge_longitudinal`
-  -> leg spin structure = (`up`, `dn`)
-  -> dominant pair = (1, 0)
-  -> inter-sublattice weight strongly dominant
-
-- `ph_spin_longitudinal`
-  -> leg spin structure = (`up`, `dn`)
-  -> dominant pair = (1, 0)
-  -> inter-sublattice weight strongly dominant
-
-- `triplet_uu`
-  -> leg spin structure = (`up`, `up`)
-  -> dominant pair = (0, 2)
-  -> same/inter weight = 0.0 / 1.0
-
-The notebook also contained explicit assertions checking that
-
-- charge leg spins were reported as (`up`, `dn`)
-- spin leg spins were reported as (`up`, `dn`)
-- singlet leg spins were reported as (`up`, `dn`)
-
-and these routing assertions passed.
-
-Most importantly, the notebook compared the reconstructed internal tensors of
-
-- `ph_charge_longitudinal`
-- `ph_spin_longitudinal`
-
-and found a nonzero difference
-
-    ||charge tensor - spin tensor|| = 1.0
-
-This is exactly the sanity check we wanted. It shows that once up/down Bloch
-eigenvectors differ, the spin-aware reconstruction really distinguishes the two
-longitudinal sectors at the internal-tensor level. In other words, the new code
-is not merely relabeling modes; it is actually using the spin-resolved Bloch
-bases in the reconstruction.
-
-Interpretation of the benchmark result
---------------------------------------
-This new benchmark should be regarded as successful.
-
-It does NOT prove that the full FRG physics is complete. It proves something
-more specific and currently more urgent:
-
-- the Benchmark 2 diagnosis layer now uses the correct spin-resolved patch
-  basis,
-- the old single-patchset logical weakness has been removed,
-- and the code is now consistent with models that preserve S_z but have
-  nonidentical up/down band eigenvectors.
-
-Practical conclusion
---------------------
-After this addendum, Benchmark 2 supports the intended use case of the project:
-
-- spin blocks may remain separate,
-- up/down sectors may differ,
-- channel kernels still come from `channels.py`,
-- and the post-processing stack can now reconstruct and diagnose leading modes
-  without silently collapsing both spin sectors onto one shared Bloch basis.
-
-Remaining limitation
---------------------
-This benchmark still uses synthetic kernels and synthetic patch Bloch data.
-It validates the logic of spin-aware reconstruction, not yet the full
-temperature-flow FRG output on a physical kagome model. That full integration
-belongs to the next stage of the project.
 
+### Module 1: Model construction (input layer)
+
+Defines the microscopic system and prepares the initial vertex.
+
+Includes:
+
+1. Non-interacting model
+   - Kagome tight-binding Hamiltonian
+   - Supports flux / SOC extensions
+   - Computes:
+        eigenvalues ε(k)
+        eigenvectors u(k)
+
+2. Interaction (extended Hubbard)
+   - Defined in orbital basis
+   - Projected to band basis via Bloch eigenvectors
+   - Produces antisymmetrized vertex:
+        Γ(k1,k2,k3,k4)
+
+3. Fermi surface patching
+   - Discretizes FS into patches
+   - Stores:
+        patch momenta k_i
+        Bloch eigenvectors u(k_i)
+   - Spin-resolved patch sets (up/down treated explicitly)
+
+4. Channel decomposition (index backbone)
+   - Converts Γ into:
+        pp / ph / ph' channel matrices
+   - Defines:
+        momentum routing conventions
+        mapping between patch indices and transfer momentum Q
+
+IMPORTANT:
+- This module defines **all index conventions**
+- Any inconsistency here propagates through the entire pipeline
+
+----------------------------------------
+
+### Module 2: Order diagnosis (analysis layer)
+
+Analyzes channel kernels during the flow.
+
+Two levels:
+
+1. Form factor analysis
+   - Diagonalizes channel kernels
+   - Extracts leading eigenmodes
+   - Handles degeneracies
+   - Classifies symmetry:
+        s, p, d, f, etc.
+
+2. Kagome-specific diagnosis
+   - Reconstructs internal order tensors:
+        Φ (particle-hole)
+        Δ (particle-particle)
+   - Matches against known kagome orders:
+        FM, PI, cBO, sBO, f-SC
+   - Outputs:
+        identified phase OR "unclassified"
+
+----------------------------------------
+
+### Module 3: One-loop kernel (physics core)
+
+Implements the fRG flow equation (Metzner Eq. 52).
+
+Includes:
+
+- Temperature-flow cutoff
+- Propagators:
+    G (full)
+    S (single-scale)
+
+- Three channels:
+    particle-particle (pp)
+    particle-hole direct (ph)
+    particle-hole crossed (ph')
+
+Key implementation:
+
+- Internal loops evaluated in patch basis
+- Momentum conservation enforced via patch mapping
+- Vectorized Matsubara summation (performance-critical)
+
+Outputs:
+    dΓ/dT in channel representation
+
+----------------------------------------
+
+### Module 4: RG flow (orchestration layer)
+
+Drives the full flow.
+
+Representation:
+
+    Γ = Γ_bare + Φ_pp + Φ_phd + Φ_phc
+
+Design choices:
+
+- Avoid full Γ(p1,p2,p3,p4) tensor (O(Np^4))
+- Work in channel representation:
+    O(NQ · Np^2)
+
+Flow procedure:
+
+1. Initialize Γ_bare
+2. For each temperature step:
+    - compute RHS (one-loop kernel)
+    - update channel corrections
+3. Periodically:
+    - reconstruct vertex (via accessor)
+    - run order diagnosis
+4. Detect instability via:
+    - leading eigenvalue growth
+
+----------------------------------------
+
+🧩 **Momentum structure (CRITICAL DESIGN)**
+
+This pipeline uses a **patch-driven definition of transfer momentum Q**:
+
+- Q is NOT externally imposed
+- Q is generated from patch combinations:
+    pp:  Q = k1 + k2
+    ph:  Q = k3 - k1
+
+- All Q values are:
+    - canonicalized modulo reciprocal lattice vectors
+    - indexed via transfer grids
+
+- Channel storage is organized by:
+    (spin block, Q index, patch indices)
+
+--------------------------------------------------
+
+🧪 **Recent improvement: Q-catalog stabilization and de-duplication**
+
+A major numerical issue was recently identified and fixed:
+
+Problem:
+- Patch discretization generates many numerically distinct but physically equivalent Q values
+- Even after canonicalization (Q ≡ Q + G), small floating-point differences caused:
+    - artificial splitting of Q sectors
+    - ~O(10–20) "distinct" Q values instead of a few symmetry-related ones
+- This led to:
+    - broken symmetry between equivalent Q sectors
+    - unstable flow behavior
+    - misleading order diagnosis
+
+Solution:
+1. Canonicalization:
+   - All Q are mapped into a reduced coordinate system (reciprocal lattice basis)
+   - Enforce Q ≡ Q + G strictly
+
+2. Near-duplicate merging:
+   - Q values are clustered using a numerical tolerance in reduced coordinates
+   - Physically equivalent Q are merged into a single representative
+   - Implemented via a transfer grid construction + clustering step
+
+Result:
+- Q catalog reduced from ~19 sectors → 4 physical sectors:
+    - Q = 0
+    - three symmetry-related M-point sectors
+- Restored symmetry between equivalent Q sectors
+- Eliminated artificial channel splitting
+- Significantly improved consistency between different patching schemes
+
+IMPORTANT:
+- Q is now treated as a **discrete physical index**, not a raw numerical value
+- All modules (flow, kernel, diagnosis) must use the SAME Q catalog
+
+--------------------------------------------------
+
+🚨 **Key consistency requirement (recently fixed)**
+
+Physical invariance:
+
+    Q ≡ Q + G   (G: reciprocal lattice vector)
+
+must hold exactly.
+
+Implementation details:
+
+- All Q are canonicalized in reciprocal space
+- Partner patch mapping is constrained by:
+    fixed transfer index (iq)
+- No free "nearest patch" mapping across different Q sectors
+- External and internal legs use the SAME Q definition
+
+This avoids:
+
+- artificial Q-dependence
+- unphysical divergence
+- incorrect order diagnosis
+
+----------------------------------------
+
+🧠 **How modules interact**
+
+- Module 1 → provides:
+    patchsets, Γ_bare
+
+- Module 3 → computes:
+    dΓ/dT from current Γ
+
+- Module 4 → updates:
+    channel representation of Γ
+
+- Module 2 → analyzes:
+    channel kernels at selected steps
+
+----------------------------------------
+
+⚙️ **Current approximation level**
+
+- One-loop fRG
+- Temperature-flow cutoff
+- Static vertex (no frequency dependence)
+- No self-energy flow
+
+Vertex structure:
+
+- Stored in reduced channel form
+- Only 6 spin-conserving spin blocks retained
+- Forbidden spin sectors set to zero
+
+Momentum treatment:
+
+- Patch discretization on FS
+- Transfer momenta discretized from patch combinations
+- All momenta treated modulo reciprocal lattice vectors
+
+----------------------------------------
+
+📌 **Notes**
+
+- Spin is treated explicitly
+- Momentum routing is fixed and consistent across modules
+- The pipeline is designed for:
+    correctness first → then performance → then extensibility

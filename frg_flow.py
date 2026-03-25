@@ -380,7 +380,7 @@ class FRGFlowSolver:
         diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
         diagnosis_sort_by: str = "abs",
         track_crossed_channel: bool = True,
-        q_merge_tol_red: float = 1e-2,
+        q_merge_tol_red: float = 5e-2,
         q_key_decimals: int = 10,
     ) -> None:
         self.patchsets = patchsets
