@@ -38,23 +38,17 @@ except Exception:
 
 from frg_kernel import (
     FlowConfig,
-    compute_pp_kernel_fast,
-    compute_ph_kernel_fast,
-    compute_phc_kernel_fast,
     normalize_spin,
     patchset_for_spin,
     shifted_patch_map,
     has_patchset,
-)
-
-
-from frg_kernel import (
     available_internal_spin_pairs,
     build_ph_internal_cache_vec,
     build_pp_internal_cache_vec,
     compute_ph_kernel_fast2,
     compute_phc_kernel_fast2,
     compute_pp_kernel_fast2,
+    partner_map_from_q_index,
 )
 
 try:
@@ -350,10 +344,24 @@ class FRGFlowSolver:
         self.diagnosis_sort_by = str(diagnosis_sort_by)
         self.track_crossed_channel = bool(track_crossed_channel)
 
+        # Diagnosis should scan only Q values that already exist as transfer-momentum
+        # blocks generated from the patch set. An optional diagnosis_Qs argument is treated
+        # only as a filter onto this internally generated catalog.
+        seen_diag = {}
+        for grid in (self.pp_grid, self.phd_grid, self.phc_grid):
+            for q in grid.q_list:
+                q_can = self.phd_grid.canonicalize(q)
+                key = self.phd_grid.key(q_can)
+                seen_diag.setdefault(key, q_can)
+        diag_catalog = list(seen_diag.values())
         if diagnosis_Qs is None:
-            self.diagnosis_Qs = [self.phd_grid.canonicalize(q) for q in self.phd_grid.q_list]
+            self.diagnosis_Qs = diag_catalog
         else:
-            self.diagnosis_Qs = [self.phd_grid.canonicalize(q) for q in diagnosis_Qs]
+            requested = {}
+            for q in diagnosis_Qs:
+                q_can = self.phd_grid.canonicalize(q)
+                requested[self.phd_grid.key(q_can)] = q_can
+            self.diagnosis_Qs = [q for key, q in seen_diag.items() if key in requested]
 
         self.state = FRGState(
             patchsets=patchsets,
@@ -485,6 +493,51 @@ class FRGFlowSolver:
 
         return gamma
 
+    def _partner_map_pp_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._pp_q_index[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.pp_grid.canonicalize(Q),
+            mode="Q_minus_k",
+        )
+
+    def _partner_map_phd_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._phd_q_index[(normalize_spin(second_spin), normalize_spin(first_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.phd_grid.canonicalize(Q),
+            mode="k_plus_Q",
+        )
+
+    def _partner_map_phc_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._phc_q_index[(normalize_spin(second_spin), normalize_spin(first_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.phc_grid.canonicalize(Q),
+            mode="k_minus_Q" if normalize_spin(first_spin) == normalize_spin(second_spin) and False else "k_plus_Q",
+        )
+
+    def _pp_internal_shift_cache(self, iq: int, Q: Sequence[float]):
+        cache = {}
+        for sa, sb in available_internal_spin_pairs(self.patchsets):
+            cache[(sa, sb)] = self._partner_map_pp_from_iq(iq, first_spin=sa, second_spin=sb, Q=Q)
+        return cache
+
+    def _ph_internal_shift_cache(self, iq: int, Q: Sequence[float]):
+        cache = {}
+        for sa, sb in available_internal_spin_pairs(self.patchsets):
+            cache[(sa, sb)] = self._partner_map_phd_from_iq(iq, first_spin=sa, second_spin=sb, Q=Q)
+        return cache
+
     def _rhs_norm(self, rhs_pp, rhs_phd, rhs_phc) -> float:
         vals: List[float] = []
         for store in (rhs_pp, rhs_phd, rhs_phc):
@@ -500,8 +553,12 @@ class FRGFlowSolver:
         rhs_phc = self._empty_channel_store(self.phc_grid)
 
         for iq, Q in enumerate(self.pp_grid.q_list):
+            ext_partner_cache = {}
+            for s1, s2 in [(a, b) for a in self._all_spins_present() for b in self._all_spins_present()]:
+                ext_partner_cache[(s1, s2)] = self._partner_map_pp_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
+            internal_cache = build_pp_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=self._pp_internal_shift_cache(iq, Q))
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_pp_kernel_fast(
+                ker = compute_pp_kernel_fast2(
                     gamma,
                     self.patchsets,
                     Q,
@@ -509,12 +566,20 @@ class FRGFlowSolver:
                     outgoing_spins=(s3, s4),
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_in_resid=ext_partner_cache[(s1, s2)],
+                    partner_out_resid=ext_partner_cache[(s3, s4)],
                 )
                 rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         for iq, Q in enumerate(self.phd_grid.q_list):
+            ext_partner_cache = {}
+            for s1 in self._all_spins_present():
+                for s2 in self._all_spins_present():
+                    ext_partner_cache[(s1, s2)] = self._partner_map_phd_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
+            internal_cache = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=self._ph_internal_shift_cache(iq, Q))
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_ph_kernel_fast(
+                ker = compute_ph_kernel_fast2(
                     gamma,
                     self.patchsets,
                     Q,
@@ -522,12 +587,30 @@ class FRGFlowSolver:
                     outgoing_spins=(s4, s2),
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_in_resid=ext_partner_cache[(s1, s3)],
+                    partner_out_resid=ext_partner_cache[(s4, s2)],
                 )
                 rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         for iq, Q in enumerate(self.phc_grid.q_list):
+            ext_out_cache = {}
+            ext_in_cache = {}
+            for s1 in self._all_spins_present():
+                for s2 in self._all_spins_present():
+                    ext_out_cache[(s1, s2)] = self._partner_map_phd_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
+                    ext_in_cache[(s1, s2)] = partner_map_from_q_index(
+                        self.patchsets,
+                        self._phc_q_index[(normalize_spin(s1), normalize_spin(s2))],
+                        source_spin=s2,
+                        target_spin=s1,
+                        iq_target=int(iq),
+                        Q=self.phc_grid.canonicalize(Q),
+                        mode="k_minus_Q",
+                    )
+            internal_cache = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=self._ph_internal_shift_cache(iq, Q))
             for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_phc_kernel_fast(
+                ker = compute_phc_kernel_fast2(
                     gamma,
                     self.patchsets,
                     Q,
@@ -535,6 +618,9 @@ class FRGFlowSolver:
                     outgoing_spins=(s3, s4),
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
+                    internal_cache=internal_cache,
+                    partner_out_resid=ext_out_cache[(s2, s3)],
+                    partner_in_resid=ext_in_cache[(s4, s1)],
                 )
                 rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
@@ -542,12 +628,13 @@ class FRGFlowSolver:
 
     def _vertex_pp_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = self.pp_grid.canonicalize(np.asarray(Q, dtype=float))
+        iq = self.pp_grid.nearest_index(Q)
         gamma = self._fast_gamma
         s1, s2 = map(normalize_spin, incoming_spins)
         s3, s4 = map(normalize_spin, outgoing_spins)
         ps_in = patchset_for_spin(self.patchsets, s1)
-        partner_in, resid_in = shifted_patch_map(self.patchsets, s2, Q, mode="Q_minus_k")
-        partner_out, resid_out = shifted_patch_map(self.patchsets, s4, Q, mode="Q_minus_k")
+        partner_in, resid_in = self._partner_map_pp_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
+        partner_out, resid_out = self._partner_map_pp_from_iq(iq, first_spin=s3, second_spin=s4, Q=Q)
         N = ps_in.Npatch
         M = np.zeros((N, N), dtype=complex)
         residuals = np.zeros((N, N), dtype=float)
@@ -555,7 +642,10 @@ class FRGFlowSolver:
             p4 = int(partner_out[pout])
             for pin in range(N):
                 p2 = int(partner_in[pin])
-                M[pout, pin] = gamma(pin, s1, p2, s2, pout, s3, p4, s4)
+                if p2 >= 0 and p4 >= 0:
+                    M[pout, pin] = gamma(pin, s1, p2, s2, pout, s3, p4, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
         return ChannelKernel(
             name="pp",
@@ -572,12 +662,13 @@ class FRGFlowSolver:
 
     def _vertex_phd_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = self.phd_grid.canonicalize(np.asarray(Q, dtype=float))
+        iq = self.phd_grid.nearest_index(Q)
         gamma = self._fast_gamma
         s1, s3 = map(normalize_spin, incoming_spins)
         s4, s2 = map(normalize_spin, outgoing_spins)
         ps1 = patchset_for_spin(self.patchsets, s1)
-        kplus_in, resid_in = shifted_patch_map(self.patchsets, s3, Q, mode="k_plus_Q")
-        kplus_out, resid_out = shifted_patch_map(self.patchsets, s2, Q, mode="k_plus_Q")
+        kplus_in, resid_in = self._partner_map_phd_from_iq(iq, first_spin=s1, second_spin=s3, Q=Q)
+        kplus_out, resid_out = self._partner_map_phd_from_iq(iq, first_spin=s4, second_spin=s2, Q=Q)
         N = ps1.Npatch
         M = np.zeros((N, N), dtype=complex)
         residuals = np.zeros((N, N), dtype=float)
@@ -585,7 +676,10 @@ class FRGFlowSolver:
             p2 = int(kplus_out[pout])
             for pin in range(N):
                 p3 = int(kplus_in[pin])
-                M[pout, pin] = gamma(pin, s1, p2, s2, p3, s3, pout, s4)
+                if p2 >= 0 and p3 >= 0:
+                    M[pout, pin] = gamma(pin, s1, p2, s2, p3, s3, pout, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
         return ChannelKernel(
             name="ph_direct",
@@ -602,20 +696,33 @@ class FRGFlowSolver:
 
     def _vertex_phc_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
         Q = self.phc_grid.canonicalize(np.asarray(Q, dtype=float))
+        iq = self.phc_grid.nearest_index(Q)
         gamma = self._fast_gamma
         s1, s2 = map(normalize_spin, incoming_spins)
         s3, s4 = map(normalize_spin, outgoing_spins)
         ps1 = patchset_for_spin(self.patchsets, s1)
-        kplus_out, resid_out = shifted_patch_map(self.patchsets, s3, Q, mode="k_plus_Q")
-        kminus_in, resid_in = shifted_patch_map(self.patchsets, s4, Q, mode="k_minus_Q")
+        kplus_out, resid_out = self._partner_map_phd_from_iq(iq, first_spin=s2, second_spin=s3, Q=Q)
+        kminus_in = partner_map_from_q_index(
+            self.patchsets,
+            self._phc_q_index[(s1, s4)],
+            source_spin=s4,
+            target_spin=s1,
+            iq_target=int(iq),
+            Q=Q,
+            mode="k_minus_Q",
+        )
+        kminus_in_idx, resid_in = kminus_in
         N = ps1.Npatch
         M = np.zeros((N, N), dtype=complex)
         residuals = np.zeros((N, N), dtype=float)
         for pout in range(N):
             p3 = int(kplus_out[pout])
             for pin in range(N):
-                p4 = int(kminus_in[pin])
-                M[pout, pin] = gamma(pin, s1, pout, s2, p3, s3, p4, s4)
+                p4 = int(kminus_in_idx[pin])
+                if p3 >= 0 and p4 >= 0:
+                    M[pout, pin] = gamma(pin, s1, pout, s2, p3, s3, p4, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
         return ChannelKernel(
             name="ph_crossed",
@@ -624,7 +731,7 @@ class FRGFlowSolver:
             row_patches=np.arange(N, dtype=int),
             col_patches=np.arange(N, dtype=int),
             row_partner_patches=np.asarray(kplus_out, dtype=int),
-            col_partner_patches=np.asarray(kminus_in, dtype=int),
+            col_partner_patches=np.asarray(kminus_in_idx, dtype=int),
             row_spins=(s2, s3),
             col_spins=(s1, s4),
             residuals=residuals,
@@ -655,7 +762,7 @@ class FRGFlowSolver:
         )
 
     def build_diagnosis_kernel_dict(self, Q: Sequence[float]) -> Dict[str, ChannelKernel]:
-        Q = self.phd_grid.canonicalize(np.asarray(Q, dtype=float))
+        Q = np.asarray(Q, dtype=float)
         out: Dict[str, ChannelKernel] = {}
 
         if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
@@ -939,29 +1046,40 @@ class FRGFlowSolver(FRGFlowSolver):
 
         for iq, Q in enumerate(self.pp_grid.q_list):
             Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._pp_qminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="Q_minus_k")
+            for s1 in spins:
+                for s2 in spins:
+                    self._pp_qminus[(iq, s1, s2)] = self._partner_map_pp_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
 
         for iq, Q in enumerate(self.phd_grid.q_list):
             Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._ph_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
+            for s1 in spins:
+                for s2 in spins:
+                    self._ph_kplus[(iq, s1, s2)] = self._partner_map_phd_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
 
         for iq, Q in enumerate(self.phc_grid.q_list):
             Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._phc_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
-                self._phc_kminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_minus_Q")
+            for s1 in spins:
+                for s2 in spins:
+                    self._phc_kplus[(iq, s1, s2)] = self._partner_map_phd_from_iq(iq, first_spin=s1, second_spin=s2, Q=Q)
+                    self._phc_kminus[(iq, s1, s2)] = partner_map_from_q_index(
+                        self.patchsets,
+                        self._phc_q_index[(normalize_spin(s2), normalize_spin(s1))],
+                        source_spin=s1,
+                        target_spin=s2,
+                        iq_target=int(iq),
+                        Q=self.phc_grid.canonicalize(Q),
+                        mode="k_minus_Q",
+                    )
 
     def _build_q_level_internal_caches(self, T: float):
         cfg = self._flow_config(T)
         pp_internal_by_iq = {}
         ph_internal_by_iq = {}
         for iq, Q in enumerate(self.pp_grid.q_list):
-            shift_cache = {(sa, sb): self._pp_qminus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            shift_cache = {(sa, sb): self._pp_qminus[(iq, sa, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
             pp_internal_by_iq[iq] = build_pp_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
         for iq, Q in enumerate(self.phd_grid.q_list):
-            shift_cache = {(sa, sb): self._ph_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            shift_cache = {(sa, sb): self._ph_kplus[(iq, sa, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
             ph_internal_by_iq[iq] = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
         return cfg, pp_internal_by_iq, ph_internal_by_iq
 
@@ -985,8 +1103,8 @@ class FRGFlowSolver(FRGFlowSolver):
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
                     internal_cache=internal_cache,
-                    partner_in_resid=self._pp_qminus[(iq, s2)],
-                    partner_out_resid=self._pp_qminus[(iq, s4)],
+                    partner_in_resid=self._pp_qminus[(iq, s1, s2)],
+                    partner_out_resid=self._pp_qminus[(iq, s3, s4)],
                 )
                 rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
@@ -1002,13 +1120,13 @@ class FRGFlowSolver(FRGFlowSolver):
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
                     internal_cache=internal_cache,
-                    partner_in_resid=self._ph_kplus[(iq, s3)],
-                    partner_out_resid=self._ph_kplus[(iq, s2)],
+                    partner_in_resid=self._ph_kplus[(iq, s1, s3)],
+                    partner_out_resid=self._ph_kplus[(iq, s4, s2)],
                 )
                 rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 
         for iq, Q in enumerate(self.phc_grid.q_list):
-            shift_cache = {(sa, sb): self._phc_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
+            shift_cache = {(sa, sb): self._phc_kplus[(iq, sa, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
             internal_cache = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
             for s1, s2, s3, s4 in self.spin_blocks:
                 ker = compute_phc_kernel_fast2(
@@ -1020,8 +1138,8 @@ class FRGFlowSolver(FRGFlowSolver):
                     config=cfg,
                     allowed_spin_blocks=self.allowed_spin_blocks,
                     internal_cache=internal_cache,
-                    partner_in_resid=self._phc_kminus[(iq, s4)],
-                    partner_out_resid=self._phc_kplus[(iq, s3)],
+                    partner_in_resid=self._phc_kminus[(iq, s4, s1)],
+                    partner_out_resid=self._phc_kplus[(iq, s2, s3)],
                 )
                 rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
 

@@ -2,6 +2,8 @@ import numpy as np
 from dataclasses import dataclass
 from typing import Dict, Mapping, Sequence, Tuple, Union
 
+from frg_kernel import normalize_spin as _normalize_spin_global, partner_map_from_q_index
+
 SpinLike = Union[str, int]
 PatchSetMap = Mapping[SpinLike, object]
 
@@ -105,6 +107,8 @@ class ChannelDecomposer:
 
         # Early validation: avoid deep stack-trace failures later.
         expected = int(self.interaction.Norb)
+        self._q_key_to_index = {}
+        self._q_values = []
         for spin, ps in patchsets.items():
             if ps is None:
                 raise ValueError(f"patchsets['{spin}'] is None.")
@@ -119,6 +123,52 @@ class ChannelDecomposer:
                     f"patchsets['{spin}'] has eigvec shape {u0.shape}, "
                     f"but interaction expects length-{expected} kagome eigenvectors."
                 )
+
+    def _build_q_index_tables(self) -> None:
+        spins = []
+        for s in ("up", "dn"):
+            try:
+                self._require_nonempty_patchset(s)
+                spins.append(s)
+            except Exception:
+                pass
+        self._pp_q_index = {}
+        self._phd_q_index = {}
+        self._phc_q_index = {}
+        for s1 in spins:
+            ps1 = self._require_nonempty_patchset(s1)
+            k1s = np.asarray([p.k_cart for p in ps1.patches], dtype=float)
+            for s2 in spins:
+                ps2 = self._require_nonempty_patchset(s2)
+                k2s = np.asarray([p.k_cart for p in ps2.patches], dtype=float)
+                arr_pp = np.zeros((ps1.Npatch, ps2.Npatch), dtype=int)
+                arr_ph = np.zeros((ps1.Npatch, ps2.Npatch), dtype=int)
+                for p1, k1 in enumerate(k1s):
+                    for p2, k2 in enumerate(k2s):
+                        arr_pp[p1, p2] = self._q_nearest_index(k1 + k2)
+                        arr_ph[p1, p2] = self._q_nearest_index(k1 - k2)
+                self._pp_q_index[(s1, s2)] = arr_pp
+                self._phd_q_index[(s1, s2)] = arr_ph
+                self._phc_q_index[(s1, s2)] = arr_ph.copy()
+
+    def _q_key(self, q: np.ndarray) -> Tuple[float, float]:
+        ref_spin = "up" if "up" in self.patchsets else next(iter(self.patchsets.keys()))
+        ps = self._require_nonempty_patchset(ref_spin)
+        b1 = np.asarray(ps.b1, dtype=float)
+        b2 = np.asarray(ps.b2, dtype=float)
+        B = np.column_stack([b1, b2])
+        uv = np.linalg.solve(B, np.asarray(q, dtype=float))
+        uv = uv - np.floor(uv)
+        uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+        uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+        return tuple(np.round(uv, 10))
+
+    def _q_nearest_index(self, q: np.ndarray) -> int:
+        key = self._q_key(q)
+        if key not in self._q_key_to_index:
+            self._q_key_to_index[key] = len(self._q_values)
+            self._q_values.append(_canonicalize_q_for_patchsets(self.patchsets, q))
+        return int(self._q_key_to_index[key])
 
     def normalize_spin(self, spin: SpinLike) -> str:
         return self.interaction.normalize_spin(spin)
@@ -231,8 +281,9 @@ class ChannelDecomposer:
         if PS_in.Npatch != PS_out.Npatch:
             raise ValueError("For pp kernel, first-leg incoming/outgoing patch counts must match.")
 
-        partner_in, resid_in = self.shifted_patch_map(s2, Q, mode="Q_minus_k")
-        partner_out, resid_out = self.shifted_patch_map(s4, Q, mode="Q_minus_k")
+        iq = self._q_nearest_index(Q)
+        partner_in, resid_in = partner_map_from_q_index(self.patchsets, self._pp_q_index[(s1, s2)], source_spin=s1, target_spin=s2, iq_target=iq, Q=Q, mode="Q_minus_k")
+        partner_out, resid_out = partner_map_from_q_index(self.patchsets, self._pp_q_index[(s3, s4)], source_spin=s3, target_spin=s4, iq_target=iq, Q=Q, mode="Q_minus_k")
 
         N = PS_in.Npatch
         M = np.zeros((N, N), dtype=complex)
@@ -244,7 +295,10 @@ class ChannelDecomposer:
             p4 = int(partner_out[pout])
             for pin in range(N):
                 p2 = int(partner_in[pin])
-                M[pout, pin] = self.gamma(pin, s1, p2, s2, pout, s3, p4, s4)
+                if p2 >= 0 and p4 >= 0:
+                    M[pout, pin] = self.gamma(pin, s1, p2, s2, pout, s3, p4, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
 
         return ChannelKernel(
@@ -276,8 +330,9 @@ class ChannelDecomposer:
         if PS1.Npatch != PS4.Npatch:
             raise ValueError("For ph-direct kernel, row/col patch counts must match.")
 
-        kplus_in, resid_in = self.shifted_patch_map(s3, Q, mode="k_plus_Q")
-        kplus_out, resid_out = self.shifted_patch_map(s2, Q, mode="k_plus_Q")
+        iq = self._q_nearest_index(Q)
+        kplus_in, resid_in = partner_map_from_q_index(self.patchsets, self._phd_q_index[(s3, s1)], source_spin=s1, target_spin=s3, iq_target=iq, Q=Q, mode="k_plus_Q")
+        kplus_out, resid_out = partner_map_from_q_index(self.patchsets, self._phd_q_index[(s2, s4)], source_spin=s4, target_spin=s2, iq_target=iq, Q=Q, mode="k_plus_Q")
 
         N = PS1.Npatch
         M = np.zeros((N, N), dtype=complex)
@@ -289,7 +344,10 @@ class ChannelDecomposer:
             p2 = int(kplus_out[pout])
             for pin in range(N):
                 p3 = int(kplus_in[pin])
-                M[pout, pin] = self.gamma(pin, s1, p2, s2, p3, s3, pout, s4)
+                if p2 >= 0 and p3 >= 0:
+                    M[pout, pin] = self.gamma(pin, s1, p2, s2, p3, s3, pout, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
 
         return ChannelKernel(
@@ -321,8 +379,9 @@ class ChannelDecomposer:
         if PS1.Npatch != PS2.Npatch:
             raise ValueError("For ph-crossed kernel, first and second spin patch counts must match.")
 
-        kplus_out, resid_out = self.shifted_patch_map(s3, Q, mode="k_plus_Q")
-        kminus_in, resid_in = self.shifted_patch_map(s4, Q, mode="k_minus_Q")
+        iq = self._q_nearest_index(Q)
+        kplus_out, resid_out = partner_map_from_q_index(self.patchsets, self._phc_q_index[(s3, s2)], source_spin=s2, target_spin=s3, iq_target=iq, Q=Q, mode="k_plus_Q")
+        kminus_in, resid_in = partner_map_from_q_index(self.patchsets, self._phc_q_index[(s1, s4)], source_spin=s1, target_spin=s4, iq_target=iq, Q=Q, mode="k_minus_Q")
 
         N = PS1.Npatch
         M = np.zeros((N, N), dtype=complex)
@@ -334,7 +393,10 @@ class ChannelDecomposer:
             p3 = int(kplus_out[pout])
             for pin in range(N):
                 p4 = int(kminus_in[pin])
-                M[pout, pin] = self.gamma(pin, s1, pout, s2, p3, s3, p4, s4)
+                if p3 >= 0 and p4 >= 0:
+                    M[pout, pin] = self.gamma(pin, s1, pout, s2, p3, s3, p4, s4)
+                else:
+                    M[pout, pin] = 0.0
                 residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
 
         return ChannelKernel(

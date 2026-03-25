@@ -8,6 +8,7 @@ SpinLike = Union[str, int]
 PatchSetMap = Mapping[SpinLike, object]
 
 
+
 def _canonicalize_q_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
     ref_spin = None
     for s in ('up', 'dn'):
@@ -31,6 +32,24 @@ def _canonicalize_q_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) ->
     q_can = B @ uv
     q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
     return q_can
+
+
+def _reduced_coords_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
+    q_can = _canonicalize_q_for_patchsets(patchsets, q)
+    ref_spin = "up" if "up" in patchsets else next(iter(patchsets.keys()))
+    ps = patchsets[ref_spin]
+    B = np.column_stack([np.asarray(ps.b1, dtype=float), np.asarray(ps.b2, dtype=float)])
+    uv = np.linalg.solve(B, np.asarray(q_can, dtype=float))
+    uv = uv - np.floor(uv)
+    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+    return uv
+
+
+def _reduced_periodic_distance(uv_a: np.ndarray, uv_b: np.ndarray) -> float:
+    duv = np.asarray(uv_a, dtype=float) - np.asarray(uv_b, dtype=float)
+    duv = duv - np.round(duv)
+    return float(np.linalg.norm(duv))
 
 
 @dataclass
@@ -101,14 +120,17 @@ class ChannelDecomposer:
       modulo reciprocal lattice vectors.
     """
 
-    def __init__(self, interaction, patchsets: PatchSetMap):
+    def __init__(self, interaction, patchsets: PatchSetMap, *, q_merge_tol_red: float = 5e-3, q_key_decimals: int = 10):
         self.interaction = interaction
         self.patchsets = patchsets
+        self.q_merge_tol_red = float(q_merge_tol_red)
+        self.q_key_decimals = int(q_key_decimals)
 
         # Early validation: avoid deep stack-trace failures later.
         expected = int(self.interaction.Norb)
         self._q_key_to_index = {}
         self._q_values = []
+        self._q_uv_values = []
         for spin, ps in patchsets.items():
             if ps is None:
                 raise ValueError(f"patchsets['{spin}'] is None.")
@@ -151,24 +173,48 @@ class ChannelDecomposer:
                 self._phd_q_index[(s1, s2)] = arr_ph
                 self._phc_q_index[(s1, s2)] = arr_ph.copy()
 
+
     def _q_key(self, q: np.ndarray) -> Tuple[float, float]:
-        ref_spin = "up" if "up" in self.patchsets else next(iter(self.patchsets.keys()))
-        ps = self._require_nonempty_patchset(ref_spin)
-        b1 = np.asarray(ps.b1, dtype=float)
-        b2 = np.asarray(ps.b2, dtype=float)
-        B = np.column_stack([b1, b2])
-        uv = np.linalg.solve(B, np.asarray(q, dtype=float))
-        uv = uv - np.floor(uv)
-        uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-        uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-        return tuple(np.round(uv, 10))
+        uv = _reduced_coords_for_patchsets(self.patchsets, q)
+        return tuple(np.round(uv, self.q_key_decimals))
+
+    def _find_q_rep_index(self, uv: np.ndarray):
+        if len(self._q_uv_values) == 0:
+            return None
+        key = tuple(np.round(np.asarray(uv, dtype=float), self.q_key_decimals))
+        if key in self._q_key_to_index:
+            return int(self._q_key_to_index[key])
+        if self.q_merge_tol_red <= 0:
+            return None
+        best_idx = None
+        best_dist = np.inf
+        for irep, uv_rep in enumerate(self._q_uv_values):
+            dist = _reduced_periodic_distance(uv, uv_rep)
+            if dist <= self.q_merge_tol_red and (
+                dist < best_dist - 1e-14
+                or (abs(dist - best_dist) <= 1e-14 and (best_idx is None or irep < best_idx))
+            ):
+                best_idx = int(irep)
+                best_dist = float(dist)
+        return best_idx
+
 
     def _q_nearest_index(self, q: np.ndarray) -> int:
-        key = self._q_key(q)
-        if key not in self._q_key_to_index:
-            self._q_key_to_index[key] = len(self._q_values)
-            self._q_values.append(_canonicalize_q_for_patchsets(self.patchsets, q))
-        return int(self._q_key_to_index[key])
+        q_can = _canonicalize_q_for_patchsets(self.patchsets, q)
+        uv = _reduced_coords_for_patchsets(self.patchsets, q_can)
+        key = tuple(np.round(uv, self.q_key_decimals))
+        if key in self._q_key_to_index:
+            return int(self._q_key_to_index[key])
+
+        irep = self._find_q_rep_index(uv)
+        if irep is not None:
+            return int(irep)
+
+        irep = len(self._q_values)
+        self._q_key_to_index[key] = irep
+        self._q_values.append(q_can)
+        self._q_uv_values.append(uv)
+        return int(irep)
 
     def normalize_spin(self, spin: SpinLike) -> str:
         return self.interaction.normalize_spin(spin)

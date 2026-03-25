@@ -145,56 +145,134 @@ def _canonicalize_q(q: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> np.nd
     return q_can
 
 
+
 class TransferGrid:
-    def __init__(self, patchsets: PatchSetMap, q_list: Sequence[Sequence[float]], *, decimals: int = 10):
+    def __init__(
+        self,
+        patchsets: PatchSetMap,
+        q_list: Sequence[Sequence[float]],
+        *,
+        decimals: int = 10,
+        merge_tol_red: float = 5e-2,
+    ):
         ref_spin = available_physical_spins(patchsets)[0]
         ps = patchset_for_spin(patchsets, ref_spin)
         self.b1 = np.asarray(ps.b1, dtype=float)
         self.b2 = np.asarray(ps.b2, dtype=float)
         self.decimals = int(decimals)
-        self.q_list = [self.canonicalize(q) for q in q_list]
+        self.merge_tol_red = float(merge_tol_red)
+
+        self.raw_q_list = [self.canonicalize(q) for q in q_list]
+        self.q_list: List[np.ndarray] = []
+        self.rep_uv_list: List[np.ndarray] = []
+        self.raw_to_rep_index: List[int] = []
+        self.rep_to_raw_indices: Dict[int, List[int]] = {}
+
+        for iraw, q in enumerate(self.raw_q_list):
+            uv = self._uv(q)
+            irep = self._find_matching_rep(uv)
+            if irep is None:
+                irep = len(self.q_list)
+                self.q_list.append(np.asarray(q, dtype=float))
+                self.rep_uv_list.append(uv)
+                self.rep_to_raw_indices[irep] = []
+            self.raw_to_rep_index.append(int(irep))
+            self.rep_to_raw_indices[int(irep)].append(int(iraw))
+
         self.key_to_index: Dict[Tuple[float, float], int] = {}
-        for i, q in enumerate(self.q_list):
-            self.key_to_index[self.key(q)] = i
+        for i, _q in enumerate(self.q_list):
+            self.key_to_index[self._exact_key_from_uv(self.rep_uv_list[i])] = i
 
     def canonicalize(self, q: Sequence[float]) -> np.ndarray:
         return _canonicalize_q(q, self.b1, self.b2)
 
-    def key(self, q: Sequence[float]) -> Tuple[float, float]:
+    def _uv(self, q: Sequence[float]) -> np.ndarray:
         uv = _reduced_coords(self.canonicalize(q), self.b1, self.b2)
-        uv = _wrap_reduced_coords_unit(uv)
-        return tuple(np.round(uv, decimals=self.decimals))
+        return _wrap_reduced_coords_unit(uv)
+
+    def _exact_key_from_uv(self, uv: np.ndarray) -> Tuple[float, float]:
+        return tuple(np.round(np.asarray(uv, dtype=float), decimals=self.decimals))
+
+    def key(self, q: Sequence[float]) -> Tuple[float, float]:
+        q_can = self.canonicalize(q)
+        uv = self._uv(q_can)
+        idx = self._find_matching_rep(uv)
+        if idx is not None:
+            return self._exact_key_from_uv(self.rep_uv_list[idx])
+        return self._exact_key_from_uv(uv)
+
+    @staticmethod
+    def _reduced_minimum_image_delta(uv_a: np.ndarray, uv_b: np.ndarray) -> np.ndarray:
+        duv = np.asarray(uv_a, dtype=float) - np.asarray(uv_b, dtype=float)
+        return duv - np.round(duv)
+
+    def _reduced_distance(self, uv_a: np.ndarray, uv_b: np.ndarray) -> float:
+        return float(np.linalg.norm(self._reduced_minimum_image_delta(uv_a, uv_b)))
+
+    def _find_matching_rep(self, uv: np.ndarray) -> Optional[int]:
+        if len(self.rep_uv_list) == 0:
+            return None
+        if self.merge_tol_red <= 0:
+            return None
+    
+        best_idx = None
+        best_dist = np.inf
+        for irep, uv_rep in enumerate(self.rep_uv_list):
+            dist = self._reduced_distance(uv, uv_rep)
+            if dist <= self.merge_tol_red and (
+                dist < best_dist - 1e-14
+                or (abs(dist - best_dist) <= 1e-14 and (best_idx is None or irep < best_idx))
+            ):
+                best_idx = int(irep)
+                best_dist = float(dist)
+        return best_idx
 
     def nearest_index(self, q: Sequence[float]) -> int:
         q_can = self.canonicalize(q)
-        key = self.key(q_can)
+        uv = self._uv(q_can)
+        key = self._exact_key_from_uv(uv)
         if key in self.key_to_index:
             return int(self.key_to_index[key])
-        dists = [np.linalg.norm(q_can - qq) for qq in self.q_list]
+
+        idx = self._find_matching_rep(uv)
+        if idx is not None:
+            return int(idx)
+
+        dists = [self._reduced_distance(uv, uv_rep) for uv_rep in self.rep_uv_list]
         return int(np.argmin(dists))
 
 
-def build_unique_q_list(patchsets: PatchSetMap, *, mode: str, decimals: int = 10) -> List[np.ndarray]:
+
+def build_unique_q_list(
+    patchsets: PatchSetMap,
+    *,
+    mode: str,
+    decimals: int = 10,
+    merge_tol_red: float = 5e-2,
+) -> List[np.ndarray]:
     ref_spin = available_physical_spins(patchsets)[0]
     ps = patchset_for_spin(patchsets, ref_spin)
     ks = np.asarray([p.k_cart for p in ps.patches], dtype=float)
-    grid = TransferGrid(patchsets, [np.zeros(2, dtype=float)], decimals=decimals)
-    zero = grid.canonicalize(np.zeros(2, dtype=float))
-    seen: Dict[Tuple[float, float], np.ndarray] = {grid.key(zero): zero}
 
+    raw_candidates: List[np.ndarray] = [np.zeros(2, dtype=float)]
     if mode == "pp":
         for k1 in ks:
             for k2 in ks:
-                q = grid.canonicalize(k1 + k2)
-                seen.setdefault(grid.key(q), q)
+                raw_candidates.append(np.asarray(k1 + k2, dtype=float))
     elif mode in {"ph", "phc"}:
         for k1 in ks:
             for k3 in ks:
-                q = grid.canonicalize(k3 - k1)
-                seen.setdefault(grid.key(q), q)
+                raw_candidates.append(np.asarray(k3 - k1, dtype=float))
     else:
         raise ValueError("mode must be one of {'pp', 'ph', 'phc'}")
-    return list(seen.values())
+
+    grid = TransferGrid(
+        patchsets,
+        raw_candidates,
+        decimals=decimals,
+        merge_tol_red=merge_tol_red,
+    )
+    return [np.asarray(q, dtype=float) for q in grid.q_list]
 
 
 @dataclass
@@ -302,22 +380,57 @@ class FRGFlowSolver:
         diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
         diagnosis_sort_by: str = "abs",
         track_crossed_channel: bool = True,
+        q_merge_tol_red: float = 1e-2,
+        q_key_decimals: int = 10,
     ) -> None:
         self.patchsets = patchsets
         self.bare_gamma = bare_gamma
         self.spin_blocks = [canonical_spin_tuple(x) for x in (spin_blocks or default_spin_blocks(patchsets))]
         self.allowed_spin_blocks = frozenset(self.spin_blocks)
 
-        if pp_Qs is None:
-            pp_Qs = build_unique_q_list(patchsets, mode="pp")
-        if ph_Qs is None:
-            ph_Qs = build_unique_q_list(patchsets, mode="ph")
-        if phc_Qs is None:
-            phc_Qs = build_unique_q_list(patchsets, mode="phc")
+        self.q_merge_tol_red = float(q_merge_tol_red)
+        self.q_key_decimals = int(q_key_decimals)
 
-        self.pp_grid = TransferGrid(patchsets, pp_Qs)
-        self.phd_grid = TransferGrid(patchsets, ph_Qs)
-        self.phc_grid = TransferGrid(patchsets, phc_Qs)
+        if pp_Qs is None:
+            pp_Qs = build_unique_q_list(
+                patchsets,
+                mode="pp",
+                decimals=self.q_key_decimals,
+                merge_tol_red=self.q_merge_tol_red,
+            )
+        if ph_Qs is None:
+            ph_Qs = build_unique_q_list(
+                patchsets,
+                mode="ph",
+                decimals=self.q_key_decimals,
+                merge_tol_red=self.q_merge_tol_red,
+            )
+        if phc_Qs is None:
+            phc_Qs = build_unique_q_list(
+                patchsets,
+                mode="phc",
+                decimals=self.q_key_decimals,
+                merge_tol_red=self.q_merge_tol_red,
+            )
+
+        self.pp_grid = TransferGrid(
+            patchsets,
+            pp_Qs,
+            decimals=self.q_key_decimals,
+            merge_tol_red=self.q_merge_tol_red,
+        )
+        self.phd_grid = TransferGrid(
+            patchsets,
+            ph_Qs,
+            decimals=self.q_key_decimals,
+            merge_tol_red=self.q_merge_tol_red,
+        )
+        self.phc_grid = TransferGrid(
+            patchsets,
+            phc_Qs,
+            decimals=self.q_key_decimals,
+            merge_tol_red=self.q_merge_tol_red,
+        )
 
         self.diagnoser = diagnoser if diagnoser is not None else (
             KagomeOrderDiagnoser(patchsets_by_spin=patchsets) if KagomeOrderDiagnoser is not None else None
