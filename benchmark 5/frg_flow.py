@@ -7,7 +7,7 @@ from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 import numpy as np
 
 try:
-    from channels import ChannelKernel, MotherChannelKernel, assemble_mother_kernel
+    from channels import ChannelKernel
 except Exception:
     @dataclass
     class ChannelKernel:
@@ -35,49 +35,6 @@ except Exception:
             else:
                 raise ValueError("sort_by must be 'abs' or 'real'.")
             return vals[order], vecs[:, order]
-
-    @dataclass
-    class MotherChannelKernel:
-        name: str
-        Q: np.ndarray
-        matrix: np.ndarray
-        basis_labels: Tuple[str, ...]
-        Npatch: int
-        residuals: np.ndarray
-
-        def hermitian_residual(self) -> float:
-            return float(np.max(np.abs(self.matrix - self.matrix.conjugate().T)))
-
-        def eig(self, sort_by: str = "abs"):
-            if sort_by == "hermitian":
-                vals, vecs = np.linalg.eigh(0.5 * (self.matrix + self.matrix.conjugate().T))
-                order = np.argsort(-vals)
-                return vals[order], vecs[:, order]
-            vals, vecs = np.linalg.eig(self.matrix)
-            if sort_by == "abs":
-                order = np.argsort(-np.abs(vals))
-            elif sort_by == "real":
-                order = np.argsort(-np.real(vals))
-            else:
-                raise ValueError("sort_by must be 'abs', 'real', or 'hermitian'.")
-            return vals[order], vecs[:, order]
-
-        def split_vector_by_block(self, vec: np.ndarray) -> Dict[str, np.ndarray]:
-            vec = np.asarray(vec, dtype=complex).reshape(len(self.basis_labels), self.Npatch)
-            return {label: vec[i].copy() for i, label in enumerate(self.basis_labels)}
-
-
-    def assemble_mother_kernel(*, name: str, Q: np.ndarray, blocks, basis_labels):
-        N = blocks[0][0].Npatch
-        nb = len(basis_labels)
-        matrix = np.zeros((nb * N, nb * N), dtype=complex)
-        residuals = np.zeros((nb * N, nb * N), dtype=float)
-        for i in range(nb):
-            for j in range(nb):
-                ker = blocks[i][j]
-                matrix[i*N:(i+1)*N, j*N:(j+1)*N] = np.asarray(ker.matrix, dtype=complex)
-                residuals[i*N:(i+1)*N, j*N:(j+1)*N] = np.asarray(ker.residuals, dtype=float)
-        return MotherChannelKernel(name=name, Q=np.asarray(Q, dtype=float), matrix=matrix, basis_labels=tuple(basis_labels), Npatch=N, residuals=residuals)
 
 from frg_kernel import (
     FlowConfig,
@@ -999,89 +956,15 @@ class FRGFlowSolver:
             )
         return out
 
-
-
-    def build_mother_kernel_dict(self, Q: Sequence[float]) -> Dict[str, MotherChannelKernel]:
-        """Build tensor-product mother kernels in patch ⊗ spin space."""
-        Q = np.asarray(Q, dtype=float)
-        raw = self.build_diagnosis_kernel_dict(Q)
-        out: Dict[str, MotherChannelKernel] = {}
-
-        pp_keys = ["pp_ud_to_ud", "pp_ud_to_du", "pp_du_to_ud", "pp_du_to_du"]
-        if all(k in raw for k in pp_keys):
-            out["pp_mother_sz0"] = assemble_mother_kernel(
-                name="pp_mother_sz0",
-                Q=Q,
-                basis_labels=("ud", "du"),
-                blocks=[
-                    [raw["pp_ud_to_ud"], raw["pp_ud_to_du"]],
-                    [raw["pp_du_to_ud"], raw["pp_du_to_du"]],
-                ],
-            )
-
-        ph_keys = ["phd_uu_to_uu", "phd_uu_to_dd", "phd_dd_to_uu", "phd_dd_to_dd"]
-        if all(k in raw for k in ph_keys):
-            out["ph_mother_longitudinal"] = assemble_mother_kernel(
-                name="ph_mother_longitudinal",
-                Q=Q,
-                basis_labels=("uu", "dd"),
-                blocks=[
-                    [raw["phd_uu_to_uu"], raw["phd_uu_to_dd"]],
-                    [raw["phd_dd_to_uu"], raw["phd_dd_to_dd"]],
-                ],
-            )
-        return out
-
-
-    def _eigenvalue_metric(self, eval0: complex) -> float:
-        if self.diagnosis_sort_by == "real":
-            return float(np.real(eval0))
-        return float(np.abs(eval0))
-
-
-    def _decompose_pp_mode(self, kernel: MotherChannelKernel, vec: np.ndarray) -> Dict[str, Any]:
-        parts = kernel.split_vector_by_block(vec)
-        ud = parts.get("ud")
-        du = parts.get("du")
-        if ud is None or du is None:
-            return {}
-        singlet = (ud - du) / np.sqrt(2.0)
-        triplet = (ud + du) / np.sqrt(2.0)
-        ws = float(np.vdot(singlet, singlet).real)
-        wt = float(np.vdot(triplet, triplet).real)
-        return {
-            "singlet_weight": ws,
-            "triplet_weight": wt,
-            "dominant_spin_structure": "singlet" if ws >= wt else "triplet",
-        }
-
-
-    def _decompose_ph_mode(self, kernel: MotherChannelKernel, vec: np.ndarray) -> Dict[str, Any]:
-        parts = kernel.split_vector_by_block(vec)
-        uu = parts.get("uu")
-        dd = parts.get("dd")
-        if uu is None or dd is None:
-            return {}
-        charge = (uu + dd) / np.sqrt(2.0)
-        spin = (uu - dd) / np.sqrt(2.0)
-        wc = float(np.vdot(charge, charge).real)
-        ws = float(np.vdot(spin, spin).real)
-        return {
-            "charge_weight": wc,
-            "spin_weight": ws,
-            "dominant_spin_structure": "charge" if wc >= ws else "spin",
-        }
-
-
     def diagnose_current_state(self) -> Dict[str, Any]:
-        """Mother-kernel diagnosis.
-
-        First compare pp/ph geometric mother channels. Only after the leading mother
-        mode is identified do we infer singlet/triplet or charge/spin from the
-        eigenvector. This avoids the projection-first artifact discussed in the
-        project notes, where `pp_singlet_sz0` can absorb pure-ph structure.
-        """
-        best_metric = -np.inf
+        preferred_names = {
+            "pp_singlet_sz0",
+            "pp_triplet_sz0",
+            "ph_charge_longitudinal",
+            "ph_spin_longitudinal",
+        }
+        fallback_prefixes = ("pp_triplet_", "phd_", "phc_")
+        best_abs_eval = -np.inf
         best = {
             "channel_name": None,
             "Q": None,
@@ -1090,52 +973,46 @@ class FRGFlowSolver:
             "diagnosis": None,
             "all_candidates": [],
         }
-        candidates = []
 
+        candidates = []
         for Q in self.diagnosis_Qs:
-            mothers = self.build_mother_kernel_dict(Q)
-            for name, kernel in mothers.items():
-                vals, vecs = kernel.eig(sort_by=self.diagnosis_sort_by)
+            kernels = self.build_diagnosis_kernel_dict(Q)
+            preferred = [(name, ker) for name, ker in kernels.items() if name in preferred_names]
+            if preferred:
+                use = preferred
+            else:
+                use = [(name, ker) for name, ker in kernels.items() if name.startswith(fallback_prefixes)]
+
+            for name, kernel in use:
+                vals, _ = kernel.eig(sort_by=self.diagnosis_sort_by)
                 if len(vals) == 0:
                     continue
-                eval0 = vals[0]
-                vec0 = vecs[:, 0]
-                metric = self._eigenvalue_metric(eval0)
-                payload = {
-                    "geometry": "pp" if name.startswith("pp_") else "ph",
-                    "mother_kernel": name,
-                    "basis_labels": list(kernel.basis_labels),
-                    "sort_by": self.diagnosis_sort_by,
-                    "leading_eigenvalue": complex(eval0),
-                    "leading_eigenvalue_abs": float(np.abs(eval0)),
-                    "hermitian_residual": float(kernel.hermitian_residual()),
-                }
-                if name.startswith("pp_"):
-                    payload.update(self._decompose_pp_mode(kernel, vec0))
-                else:
-                    payload.update(self._decompose_ph_mode(kernel, vec0))
-
+                lam = float(np.abs(vals[0]))
+                diag_summary = None
+                order_label = None
+                if self.diagnoser is not None:
+                    diag = self.diagnoser.diagnose_kernel(kernel, sort_by=self.diagnosis_sort_by)
+                    diag_summary = diag.summary_dict()
+                    order_label = diag.paper_label
                 candidate = {
                     "channel_name": name,
                     "Q": np.asarray(Q, dtype=float),
-                    "abs_eigenvalue": float(np.abs(eval0)),
-                    "metric_value": metric,
-                    "order_label": None,
-                    "diagnosis": payload,
+                    "abs_eigenvalue": lam,
+                    "order_label": order_label,
+                    "diagnosis": diag_summary,
                 }
                 candidates.append(candidate)
-                if metric > best_metric:
-                    best_metric = metric
+                if lam > best_abs_eval:
+                    best_abs_eval = lam
                     best = dict(candidate)
 
-        candidates_sorted = sorted(candidates, key=lambda x: x["metric_value"], reverse=True)
+        candidates_sorted = sorted(candidates, key=lambda x: x["abs_eigenvalue"], reverse=True)
         best["all_candidates"] = [
             {
                 "channel_name": c["channel_name"],
                 "Q": c["Q"].tolist(),
-                "metric_value": c["metric_value"],
                 "abs_eigenvalue": c["abs_eigenvalue"],
-                "dominant_spin_structure": None if c["diagnosis"] is None else c["diagnosis"].get("dominant_spin_structure"),
+                "order_label": c["order_label"],
             }
             for c in candidates_sorted
         ]

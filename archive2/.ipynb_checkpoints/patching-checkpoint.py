@@ -1,3 +1,4 @@
+
 import numpy as np
 from dataclasses import dataclass, replace
 from typing import Optional, List, Tuple
@@ -94,15 +95,29 @@ class PatchSet:
 
 class FSPatcher:
     """
-    Periodized contour-based patcher for 2D models.
+    Unified first-BZ contour-based patcher for 2D kagome-like models.
 
-    Key changes compared with the old version
-    -----------------------------------------
-    1. Default contour level is the exact target mu.
-    2. Contours are extracted in an extended periodic window in reduced coords,
-       so Fermi surfaces crossing the first BZ boundary are not clipped first.
-    3. Low-|vF| stationary points are kept as anchors. For kagome van Hove with
-       Npatch=6 and mu=0 this should recover the six M points automatically.
+    Important convention
+    --------------------
+    - If orbital_slice is None:
+        patch the full model, and band_index is the global band index.
+    - If orbital_slice is not None:
+        patch only that block, and band_index is the LOCAL band index
+        inside the selected block.
+
+    Gauge convention
+    ----------------
+    Band eigenvectors are only defined up to a k-dependent U(1) phase.
+    For band-projected interactions this means raw patch-basis matrix
+    elements are gauge-covariant, not entrywise gauge-invariant.
+    To make patchwise quantities smoother and more interpretable, this
+    patcher can optionally enforce a contour-local gauge choice.
+
+    Example for a 6x6 spin-conserving kagome model:
+        orbital_slice = slice(0, 3)  -> first 3x3 block
+        orbital_slice = slice(3, 6)  -> second 3x3 block
+
+        then band_index should be 0, 1, or 2.
     """
 
     def __init__(
@@ -124,12 +139,6 @@ class FSPatcher:
         gauge_anchor: str = "max_component",
         close_loop_gauge: bool = True,
         verbose: bool = False,
-        strict_mu_contour: bool = True,
-        allow_level_shift_fallback: bool = False,
-        anchor_stationary_points: bool = True,
-        stationary_vf_rel_tol: float = 1e-2,
-        fs_energy_tol: float = 1e-10,
-        periodized_padding_red: float = 0.5,
     ):
         self.model = model
         self.band_index = band_index
@@ -147,15 +156,8 @@ class FSPatcher:
         self.close_loop_gauge = close_loop_gauge
         self.verbose = verbose
 
-        self.strict_mu_contour = bool(strict_mu_contour)
-        self.allow_level_shift_fallback = bool(allow_level_shift_fallback)
-        self.anchor_stationary_points = bool(anchor_stationary_points)
-        self.stationary_vf_rel_tol = float(stationary_vf_rel_tol)
-        self.fs_energy_tol = float(fs_energy_tol)
-        self.periodized_padding_red = float(periodized_padding_red)
-
         if auto_level_shifts is None:
-            self.auto_level_shifts = [0.0]
+            self.auto_level_shifts = [0.0, 1e-4, -1e-4, 5e-4, -5e-4]
         else:
             self.auto_level_shifts = list(auto_level_shifts)
 
@@ -164,9 +166,7 @@ class FSPatcher:
 
         valid_gauges = {None, "parallel_transport"}
         if self.gauge_fix not in valid_gauges:
-            raise ValueError(
-                f"Unsupported gauge_fix={self.gauge_fix!r}. Valid choices: {sorted(valid_gauges, key=str)}"
-            )
+            raise ValueError(f"Unsupported gauge_fix={self.gauge_fix!r}. Valid choices: {sorted(valid_gauges, key=str)}")
 
     # ------------------------
     # reciprocal helpers
@@ -197,10 +197,7 @@ class FSPatcher:
 
     def wrap_red(self, uv: np.ndarray) -> np.ndarray:
         uv = np.asarray(uv, dtype=float)
-        uv = uv - np.floor(uv)
-        uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-        uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-        return uv
+        return uv - np.floor(uv)
 
     def wrap_cart(self, k: np.ndarray) -> np.ndarray:
         return self.red_to_cart(self.wrap_red(self.cart_to_red(k)))
@@ -212,12 +209,20 @@ class FSPatcher:
         return np.asarray(self.model.Hk(kx, ky), dtype=complex)
 
     def _sector_hamiltonian(self, kx: float, ky: float) -> np.ndarray:
+        """
+        Hamiltonian seen by the patcher.
+        If orbital_slice is None, use the full Hamiltonian.
+        If orbital_slice is set, restrict to that block.
+        """
         H = self._full_hamiltonian(kx, ky)
         if self.orbital_slice is None:
             return H
         return H[self.orbital_slice, self.orbital_slice]
 
     def _sector_eigenstate(self, kx: float, ky: float):
+        """
+        Eigen-decomposition in the sector seen by the patcher.
+        """
         H = self._sector_hamiltonian(kx, ky)
         evals, evecs = np.linalg.eigh(H)
         return evals, evecs
@@ -225,7 +230,8 @@ class FSPatcher:
     def _validate_band_index(self, nband: int):
         if not (0 <= self.band_index < nband):
             raise ValueError(
-                f"band_index={self.band_index} out of range for current sector with {nband} bands."
+                f"band_index={self.band_index} out of range for current sector "
+                f"with {nband} bands."
             )
 
     # ------------------------
@@ -242,6 +248,16 @@ class FSPatcher:
         return np.asarray(evecs[:, self.band_index], dtype=complex)
 
     def get_mu(self) -> float:
+        """
+        Keep the same convention as before:
+        - explicit mu is used directly
+        - otherwise ask the full model for EF_from_filling
+
+        Note:
+        for spinful sector-patching this is a pragmatic choice.
+        If later you want true sector-resolved filling control, that should be
+        implemented separately.
+        """
         if self.mu is not None:
             return float(self.mu)
         return float(self.model.EF_from_filling(self.filling))
@@ -292,6 +308,15 @@ class FSPatcher:
         return u
 
     def smooth_patch_eigvecs(self, eigvecs: np.ndarray) -> Tuple[np.ndarray, float]:
+        """
+        Parallel-transport gauge along the ordered FS contour.
+
+        Returns
+        -------
+        smoothed_eigvecs : ndarray, shape (Npatch, Norb_sector)
+        loop_phase : float
+            Net holonomy phase before optional loop-closure correction.
+        """
         U = np.asarray(eigvecs, dtype=complex).copy()
         if U.ndim != 2:
             raise ValueError("eigvecs must be a 2D array of shape (Npatch, Norb).")
@@ -316,8 +341,12 @@ class FSPatcher:
                 loop_phase = float(np.angle(ov_last))
 
         if self.close_loop_gauge and N > 1 and np.abs(loop_phase) > 1e-14:
+            # Distribute the residual holonomy smoothly around the loop while
+            # keeping patch 0 fixed.
             for p in range(N):
                 U[p] *= np.exp(1j * (p / N) * loop_phase)
+
+            # Re-anchor patch 0 exactly, then restore continuity once.
             U[0] = self._anchor_phase(U[0])
             for p in range(1, N):
                 ov = np.vdot(U[p - 1], U[p])
@@ -332,27 +361,16 @@ class FSPatcher:
     # ------------------------
     # refine point to exact FS
     # ------------------------
-    def project_to_fs(self, k0: np.ndarray, mu: float, nstep: int = 30) -> np.ndarray:
+    def project_to_fs(self, k0: np.ndarray, mu: float, nstep: int = 8) -> np.ndarray:
         k = np.array(k0, dtype=float)
         for _ in range(nstep):
             e = self.band_energy(k[0], k[1])
-            de = e - mu
-            if abs(de) < self.fs_energy_tol:
-                return k
             v = self.fermi_velocity(k[0], k[1])
-            vv = float(np.dot(v, v))
-            if vv < 1e-20:
-                # Stationary point on the FS: exactly what we want to preserve
-                return k
-            k = k - (de / vv) * v
-
-        e = self.band_energy(k[0], k[1])
-        if abs(e - mu) > max(self.fs_energy_tol, 1e-8):
-            raise RuntimeError(f"project_to_fs did not converge: final |E-mu|={abs(e - mu):.3e}")
+            vv = np.dot(v, v)
+            if vv < 1e-14:
+                break
+            k = k - ((e - mu) / vv) * v
         return k
-
-    def refine_contour_to_true_fs(self, contour: np.ndarray, mu: float) -> np.ndarray:
-        return np.asarray([self.project_to_fs(k, mu) for k in np.asarray(contour, dtype=float)], dtype=float)
 
     # ------------------------
     # first BZ geometry
@@ -363,7 +381,8 @@ class FSPatcher:
             for n2 in [-1, 0, 1]:
                 if n1 == 0 and n2 == 0:
                     continue
-                Gs.append(n1 * self.b1 + n2 * self.b2)
+                G = n1 * self.b1 + n2 * self.b2
+                Gs.append(G)
         Gs = np.array(Gs, dtype=float)
 
         norms = np.linalg.norm(Gs, axis=1)
@@ -389,15 +408,20 @@ class FSPatcher:
                 if good:
                     verts.append(k)
 
+        verts = np.array(verts, dtype=float)
+
         uniq = []
-        for v in np.asarray(verts, dtype=float):
+        for v in verts:
             if not any(np.linalg.norm(v - u) < 1e-8 for u in uniq):
                 uniq.append(v)
-        verts = np.asarray(uniq, dtype=float)
+        verts = np.array(uniq, dtype=float)
 
         center = np.mean(verts, axis=0)
         ang = np.arctan2(verts[:, 1] - center[1], verts[:, 0] - center[0])
-        return verts[np.argsort(ang)]
+        order = np.argsort(ang)
+        verts = verts[order]
+
+        return verts
 
     @staticmethod
     def point_in_polygon(point: np.ndarray, polygon: np.ndarray) -> bool:
@@ -414,42 +438,38 @@ class FSPatcher:
         return inside
 
     # ------------------------
-    # periodized energy grid + contour extraction
+    # energy grid + contour extraction
     # ------------------------
-    def build_energy_grid_periodized(self):
-        """
-        Build E(k) on an extended periodic window in reduced coordinates.
+    def build_energy_grid_first_bz(self):
+        verts = self.first_bz_vertices()
 
-        We evaluate the energy on wrapped k, but keep the unwrapped cartesian
-        coordinates for contour geometry. This avoids clipping a contour at the
-        first-BZ boundary before we know which periodic representative is correct.
-        """
-        pad = self.periodized_padding_red
-        us = np.linspace(-pad, 1.0 + pad, self.grid_size)
-        vs = np.linspace(-pad, 1.0 + pad, self.grid_size)
-        U, V = np.meshgrid(us, vs, indexing="xy")
+        xmin, ymin = np.min(verts, axis=0)
+        xmax, ymax = np.max(verts, axis=0)
 
-        KX = np.zeros_like(U, dtype=float)
-        KY = np.zeros_like(V, dtype=float)
-        E = np.zeros_like(U, dtype=float)
+        kxs = np.linspace(xmin, xmax, self.grid_size)
+        kys = np.linspace(ymin, ymax, self.grid_size)
+        KX, KY = np.meshgrid(kxs, kys, indexing="xy")
 
-        for i in range(U.shape[0]):
-            for j in range(U.shape[1]):
-                uv = np.array([U[i, j], V[i, j]], dtype=float)
-                k_ext = self.red_to_cart(uv)
-                k_phys = self.red_to_cart(self.wrap_red(uv))
-                KX[i, j] = k_ext[0]
-                KY[i, j] = k_ext[1]
-                E[i, j] = self.band_energy(k_phys[0], k_phys[1])
+        E = np.full_like(KX, np.nan, dtype=float)
+        mask = np.zeros_like(KX, dtype=bool)
 
-        return KX, KY, E, self.first_bz_vertices()
+        for i in range(KX.shape[0]):
+            for j in range(KX.shape[1]):
+                k = np.array([KX[i, j], KY[i, j]])
+                if self.point_in_polygon(k, verts):
+                    mask[i, j] = True
+                    E[i, j] = self.band_energy(k[0], k[1])
 
-    def extract_fs_contours_periodized(self, KX, KY, E, mu_level):
+        return KX, KY, E, mask, verts
+
+    def extract_fs_contours_first_bz(self, KX, KY, E, mask, mu_level):
         import matplotlib.pyplot as plt
+
+        Em = np.ma.array(E, mask=~mask)
 
         fig = plt.figure()
         ax = fig.add_subplot(111)
-        cs = ax.contour(KX, KY, E, levels=[mu_level])
+        cs = ax.contour(KX, KY, Em, levels=[mu_level])
         plt.close(fig)
 
         contours = []
@@ -459,10 +479,11 @@ class FSPatcher:
         for seg in cs.allsegs[0]:
             if seg.shape[0] >= self.contour_min_points:
                 contours.append(np.array(seg, dtype=float))
+
         return contours
 
     # ------------------------
-    # contour helpers / scoring
+    # contour scoring
     # ------------------------
     @staticmethod
     def contour_length(contour: np.ndarray, closed: bool = True) -> float:
@@ -485,119 +506,35 @@ class FSPatcher:
     def polygon_contains_point(self, contour: np.ndarray, point: np.ndarray) -> bool:
         return self.point_in_polygon(point, contour)
 
-    def close_contour_if_needed(self, contour: np.ndarray) -> np.ndarray:
-        if contour.shape[0] < 2:
-            return contour
-        if np.linalg.norm(contour[0] - contour[-1]) > 1e-10:
-            contour = np.vstack([contour, contour[0]])
-        return contour
-
-    def detect_stationary_anchors_on_contour(self, contour: np.ndarray, mu: float) -> np.ndarray:
-        """
-        Detect low-|vF| local minima along the contour.
-
-        This is model-agnostic and preserves van-Hove / saddle points when present.
-        """
-        contour = np.asarray(contour, dtype=float)
-        if contour.shape[0] < 3:
-            return np.zeros((0, 2), dtype=float)
-
-        loop = self.close_contour_if_needed(contour)
-        pts = loop[:-1]
-        pts_refined = np.array([self.project_to_fs(k, mu) for k in pts], dtype=float)
-        vnorm = np.array([np.linalg.norm(self.fermi_velocity(k[0], k[1])) for k in pts_refined], dtype=float)
-
-        vmax = float(np.max(vnorm)) if len(vnorm) else 0.0
-        if vmax <= 0:
-            return pts_refined.copy()
-
-        thresh = self.stationary_vf_rel_tol * vmax
-
-        cand = []
-        n = len(vnorm)
-        for i in range(n):
-            im = (i - 1) % n
-            ip = (i + 1) % n
-            if vnorm[i] <= vnorm[im] and vnorm[i] <= vnorm[ip] and vnorm[i] <= thresh:
-                cand.append(i)
-
-        if len(cand) == 0:
-            return np.zeros((0, 2), dtype=float)
-
-        anchors = []
-        for idx in cand:
-            k = pts_refined[idx]
-            if not any(np.linalg.norm(k - a) < 1e-6 for a in anchors):
-                anchors.append(k)
-
-        anchors = np.asarray(anchors, dtype=float)
-        if anchors.shape[0] == 0:
-            return anchors
-
-        center = np.mean(anchors, axis=0)
-        ang = np.arctan2(anchors[:, 1] - center[1], anchors[:, 0] - center[0])
-        return anchors[np.argsort(ang)]
-
-    def _contour_score_with_anchors(self, contour: np.ndarray, anchors: np.ndarray) -> Tuple:
+    def score_contour(self, contour: np.ndarray) -> Tuple:
         closed = self.is_contour_closed(contour, tol=5e-2)
         length = self.contour_length(contour, closed=closed)
 
-        target = np.zeros(2, dtype=float) if self.contour_target_k is None else np.asarray(self.contour_target_k, dtype=float)
-
         encloses_target = False
-        if closed:
-            try:
-                encloses_target = self.polygon_contains_point(contour, target)
-            except Exception:
-                encloses_target = False
+        target_dist = 0.0
+        if self.contour_target_k is not None:
+            centroid = self.contour_centroid(contour)
+            target_dist = np.linalg.norm(centroid - self.contour_target_k)
+            if closed:
+                try:
+                    encloses_target = self.polygon_contains_point(contour, self.contour_target_k)
+                except Exception:
+                    encloses_target = False
 
-        centroid = self.contour_centroid(contour)
-        target_dist = float(np.linalg.norm(centroid - target))
-
-        return (
-            int(anchors.shape[0]),                                # more stationary anchors is better
-            1 if (self.prefer_closed_contour and closed) else 0,  # closed preferred
-            1 if encloses_target else 0,                          # central rep preferred
-            float(length),                                        # longer preferred
-            -target_dist,                                         # closer centroid to target preferred
+        sort_key = (
+            1 if (self.prefer_closed_contour and closed) else 0,
+            1 if encloses_target else 0,
+            length,
+            -target_dist,
         )
+        return sort_key
 
-    def choose_best_contour_exact_mu(self, KX, KY, E, mu):
-        contours = self.extract_fs_contours_periodized(KX, KY, E, mu)
-        if len(contours) == 0:
-            raise RuntimeError(
-                f"No valid FS contour found exactly at mu={mu:.12g}. Increase grid_size or enable fallback explicitly."
-            )
-
+    def choose_best_contour_over_shifts(self, KX, KY, E, mask, mu):
         best = None
-        best_anchors = None
-        for c in contours:
-            c_ref = self.refine_contour_to_true_fs(c, mu)
-            anchors = (
-                self.detect_stationary_anchors_on_contour(c_ref, mu)
-                if self.anchor_stationary_points
-                else np.zeros((0, 2), dtype=float)
-            )
-            key = self._contour_score_with_anchors(c_ref, anchors)
-            if self.verbose:
-                print(
-                    f"[FSPatcher] exact-mu contour: "
-                    f"closed={self.is_contour_closed(c_ref)} "
-                    f"n_anchor={anchors.shape[0]} key={key}"
-                )
-            if best is None or key > best[0]:
-                best = (key, c_ref)
-                best_anchors = anchors
-
-        return best[1], float(mu), best_anchors
-
-    def choose_best_contour_over_shifts(self, KX, KY, E, mu):
-        best = None
-        best_anchors = None
 
         for shift in self.auto_level_shifts:
             mu_level = mu + shift
-            contours = self.extract_fs_contours_periodized(KX, KY, E, mu_level)
+            contours = self.extract_fs_contours_first_bz(KX, KY, E, mask, mu_level)
 
             if self.verbose:
                 print(f"[FSPatcher] shift={shift:.2e}, n_contours={len(contours)}")
@@ -605,32 +542,38 @@ class FSPatcher:
             if len(contours) == 0:
                 continue
 
+            scored = []
             for c in contours:
-                c_ref = self.refine_contour_to_true_fs(c, mu)
-                anchors = (
-                    self.detect_stationary_anchors_on_contour(c_ref, mu)
-                    if self.anchor_stationary_points
-                    else np.zeros((0, 2), dtype=float)
-                )
-                key = self._contour_score_with_anchors(c_ref, anchors)
+                key = self.score_contour(c)
+                scored.append((key, c))
 
-                if self.verbose:
-                    print(f"[FSPatcher]   key={key} at mu_level={mu_level:.12g}")
+            scored.sort(key=lambda x: x[0], reverse=True)
+            local_best_key, local_best_contour = scored[0]
 
-                if best is None or key > best[0]:
-                    best = (key, c_ref, mu_level)
-                    best_anchors = anchors
+            if self.verbose:
+                print(f"[FSPatcher]   best key={local_best_key}")
+
+            if best is None or local_best_key > best[0]:
+                best = (local_best_key, local_best_contour, mu_level)
 
         if best is None:
             raise RuntimeError("No valid FS contour found for any tested contour level.")
 
-        return best[1], best[2], best_anchors
+        return best[1], best[2]
 
     # ------------------------
     # contour resampling
     # ------------------------
+    def close_contour_if_needed(self, contour: np.ndarray) -> np.ndarray:
+        if contour.shape[0] < 2:
+            return contour
+        if np.linalg.norm(contour[0] - contour[-1]) > 1e-10:
+            contour = np.vstack([contour, contour[0]])
+        return contour
+
     def resample_contour_by_arclength(self, contour: np.ndarray, Npatch: int):
         contour = self.close_contour_if_needed(contour)
+
         diffs = np.diff(contour, axis=0)
         seglen = np.linalg.norm(diffs, axis=1)
         s = np.concatenate([[0.0], np.cumsum(seglen)])
@@ -651,88 +594,10 @@ class FSPatcher:
                 continue
 
             alpha = (t - s[idx]) / ds
-            reps.append((1.0 - alpha) * contour[idx] + alpha * contour[idx + 1])
+            k = (1.0 - alpha) * contour[idx] + alpha * contour[idx + 1]
+            reps.append(k)
 
         return reps
-
-    def resample_contour_with_anchors(self, contour: np.ndarray, anchors: np.ndarray, Npatch: int):
-        contour = self.close_contour_if_needed(np.asarray(contour, dtype=float))
-        anchors = np.asarray(anchors, dtype=float)
-
-        if anchors.shape[0] == 0:
-            return self.resample_contour_by_arclength(contour, Npatch)
-
-        if anchors.shape[0] > Npatch:
-            raise ValueError(f"Found {anchors.shape[0]} anchors, but Npatch={Npatch} is smaller.")
-
-        if anchors.shape[0] == Npatch:
-            return [a.copy() for a in anchors]
-
-        diffs = np.diff(contour, axis=0)
-        seglen = np.linalg.norm(diffs, axis=1)
-        s = np.concatenate([[0.0], np.cumsum(seglen)])
-        total = s[-1]
-
-        def nearest_s_of_point(k):
-            d = np.linalg.norm(contour[:-1] - k[None, :], axis=1)
-            j = int(np.argmin(d))
-            return s[j]
-
-        anchor_s = np.array([nearest_s_of_point(a) for a in anchors], dtype=float)
-        order = np.argsort(anchor_s)
-        anchor_s = anchor_s[order]
-        anchors = anchors[order]
-
-        n_extra = Npatch - len(anchors)
-        if n_extra == 0:
-            return [a.copy() for a in anchors]
-
-        seg_lengths = []
-        for i in range(len(anchor_s)):
-            s0 = anchor_s[i]
-            s1 = anchor_s[(i + 1) % len(anchor_s)]
-            ds = s1 - s0 if s1 > s0 else (total - s0 + s1)
-            seg_lengths.append(ds)
-        seg_lengths = np.array(seg_lengths, dtype=float)
-
-        raw_counts = n_extra * seg_lengths / np.sum(seg_lengths)
-        extra_counts = np.floor(raw_counts).astype(int)
-        remain = n_extra - np.sum(extra_counts)
-
-        if remain > 0:
-            frac = raw_counts - extra_counts
-            add_order = np.argsort(-frac)
-            for j in add_order[:remain]:
-                extra_counts[j] += 1
-
-        def interp_at_s(t):
-            if t < 0:
-                t += total
-            if t >= total:
-                t -= total
-            idx = np.searchsorted(s, t, side="right") - 1
-            idx = min(max(idx, 0), len(seglen) - 1)
-            ds = seglen[idx]
-            if ds < 1e-14:
-                return contour[idx].copy()
-            alpha = (t - s[idx]) / ds
-            return (1.0 - alpha) * contour[idx] + alpha * contour[idx + 1]
-
-        extra_pts = []
-        for i in range(len(anchor_s)):
-            c = int(extra_counts[i])
-            if c <= 0:
-                continue
-            s0 = anchor_s[i]
-            s1 = anchor_s[(i + 1) % len(anchor_s)]
-            ds = s1 - s0 if s1 > s0 else (total - s0 + s1)
-            for m in range(1, c + 1):
-                extra_pts.append(interp_at_s(s0 + ds * m / (c + 1)))
-
-        all_pts = np.vstack([anchors, np.asarray(extra_pts, dtype=float)]) if len(extra_pts) else anchors.copy()
-        center = np.mean(all_pts, axis=0)
-        ang = np.arctan2(all_pts[:, 1] - center[1], all_pts[:, 0] - center[0])
-        return [all_pts[i].copy() for i in np.argsort(ang)]
 
     # ------------------------
     # main
@@ -741,47 +606,28 @@ class FSPatcher:
         mu = self.get_mu()
         filling = self.filling if self.filling is not None else np.nan
 
-        KX, KY, E, verts = self.build_energy_grid_periodized()
-
-        if self.strict_mu_contour:
-            try:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_exact_mu(KX, KY, E, mu)
-            except RuntimeError:
-                if not self.allow_level_shift_fallback:
-                    raise
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_over_shifts(KX, KY, E, mu)
-        else:
-            if self.allow_level_shift_fallback:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_over_shifts(KX, KY, E, mu)
-            else:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_exact_mu(KX, KY, E, mu)
-
-        main_contour = self.refine_contour_to_true_fs(main_contour, mu)
-
-        if self.anchor_stationary_points and anchors is None:
-            anchors = self.detect_stationary_anchors_on_contour(main_contour, mu)
-        elif anchors is None:
-            anchors = np.zeros((0, 2), dtype=float)
-
-        reps = self.resample_contour_with_anchors(main_contour, anchors, self.Npatch)
+        KX, KY, E, mask, verts = self.build_energy_grid_first_bz()
+        main_contour, mu_used_for_contour = self.choose_best_contour_over_shifts(KX, KY, E, mask, mu)
+        reps = self.resample_contour_by_arclength(main_contour, self.Npatch)
 
         patches = []
         raw_eigvecs = []
         for pid, k0 in enumerate(reps):
-            kf = self.project_to_fs(k0, mu)
+            kf = self.project_to_fs(k0, mu)  # project back to the true mu, not shifted contour level
             uv = self.wrap_red(self.cart_to_red(kf))
             e = self.band_energy(kf[0], kf[1])
             vf = self.fermi_velocity(kf[0], kf[1])
-            eig = self._normalize_eigvec(self.band_eigvec(kf[0], kf[1]))
+            eig = self.band_eigvec(kf[0], kf[1])   # already sector-local if orbital_slice is set
+            eig = self._normalize_eigvec(eig)
             raw_eigvecs.append(eig)
 
             patches.append(
                 PatchPoint(
                     patch_id=pid,
-                    k_cart=np.asarray(kf, dtype=float),
+                    k_cart=kf,
                     k_red=uv,
-                    energy=float(e),
-                    vF=np.asarray(vf, dtype=float),
+                    energy=e,
+                    vF=vf,
                     vF_norm=float(np.linalg.norm(vf)),
                     eigvec=eig,
                     orbital_weight=self.orbital_weight(eig),
