@@ -47,12 +47,11 @@ Includes:
         Bloch eigenvectors u(k_i)
    - Spin-resolved patch sets (up/down treated explicitly)
 
-4. Channel decomposition (index backbone)
-   - Converts Γ into:
-        pp / ph / ph' channel matrices
+4. Momentum indexing backbone
    - Defines:
-        momentum routing conventions
-        mapping between patch indices and transfer momentum Q
+        momentum conservation
+        mapping between patch indices
+        transfer momentum Q conventions
 
 IMPORTANT:
 - This module defines **all index conventions**
@@ -62,22 +61,26 @@ IMPORTANT:
 
 ### Module 2: Order diagnosis (analysis layer)
 
-Analyzes channel kernels during the flow.
+Analyzes channel kernels reconstructed from the full vertex.
 
 Two levels:
 
-1. Form factor analysis
-   - Diagonalizes channel kernels
-   - Extracts leading eigenmodes
-   - Handles degeneracies
-   - Classifies symmetry:
-        s, p, d, f, etc.
+1. Mother-kernel construction
+   - Builds channel kernels from Γ:
+        pp: pair space (k, Q-k)
+        ph: bilinear space (k → k+Q)
+   - Keeps full spin ⊗ momentum tensor structure
+   - No premature projection into charge/spin or singlet/triplet
 
-2. Kagome-specific diagnosis
-   - Reconstructs internal order tensors:
-        Φ (particle-hole)
-        Δ (particle-particle)
-   - Matches against known kagome orders:
+2. Eigenmode analysis
+   - Diagonalizes mother kernels
+   - Extracts leading eigenmodes
+   - Interprets eigenvectors as:
+        pairing symmetry (pp)
+        density/spin patterns (ph)
+
+3. Kagome-specific diagnosis (optional)
+   - Matches eigenmodes against known kagome orders:
         FM, PI, cBO, sBO, f-SC
    - Outputs:
         identified phase OR "unclassified"
@@ -102,12 +105,15 @@ Includes:
 
 Key implementation:
 
+- FULL vertex Γ is used directly in all diagrams
+- No reduced-channel storage
 - Internal loops evaluated in patch basis
-- Momentum conservation enforced via patch mapping
-- Vectorized Matsubara summation (performance-critical)
+- Momentum conservation enforced explicitly
+- Q handled via canonicalization:
+        Q ≡ Q + G
 
 Outputs:
-    dΓ/dT in channel representation
+    dΓ/dT in full vertex representation
 
 ----------------------------------------
 
@@ -117,25 +123,29 @@ Drives the full flow.
 
 Representation:
 
-    Γ = Γ_bare + Φ_pp + Φ_phd + Φ_phc
+    Γ(s1,s2,s3,s4; p1,p2,p3)
+
+with:
+    p4 determined by momentum conservation
 
 Design choices:
 
-- Avoid full Γ(p1,p2,p3,p4) tensor (O(Np^4))
-- Work in channel representation:
-    O(NQ · Np^2)
+- Store full vertex (3 independent momentum indices)
+- No decomposition:
+        Γ ≠ Γ_bare + Φ_pp + Φ_phd + Φ_phc
+- Channel decomposition only used inside one-loop kernel
 
 Flow procedure:
 
 1. Initialize Γ_bare
 2. For each temperature step:
-    - compute RHS (one-loop kernel)
-    - update channel corrections
+    - compute RHS using one-loop diagrams
+    - update full Γ
 3. Periodically:
-    - reconstruct vertex (via accessor)
-    - run order diagnosis
+    - build channel kernels from Γ
+    - perform eigenmode analysis
 4. Detect instability via:
-    - leading eigenvalue growth
+    - divergence of leading eigenvalue
 
 ----------------------------------------
 
@@ -150,14 +160,15 @@ This pipeline uses a **patch-driven definition of transfer momentum Q**:
 
 - All Q values are:
     - canonicalized modulo reciprocal lattice vectors
-    - indexed via transfer grids
+    - grouped with tolerance in reduced coordinates
 
-- Channel storage is organized by:
-    (spin block, Q index, patch indices)
+- Internal loops use Q-constrained partner mapping:
+    pp: k ↔ Q - k
+    ph: k ↔ k + Q
 
 ----------------------------------------
 
-🚨 **Key consistency requirement (recently fixed)**
+🚨 **Key consistency requirement**
 
 Physical invariance:
 
@@ -168,16 +179,17 @@ must hold exactly.
 Implementation details:
 
 - All Q are canonicalized in reciprocal space
-- Partner patch mapping is constrained by:
-    fixed transfer index (iq)
-- No free "nearest patch" mapping across different Q sectors
-- External and internal legs use the SAME Q definition
+- Same Q definition used in:
+    - flow (internal loops)
+    - vertex storage (closure)
+    - diagnosis (kernel construction)
+- No fallback or mixed closure rules
 
 This avoids:
 
 - artificial Q-dependence
-- unphysical divergence
-- incorrect order diagnosis
+- incorrect kernel reconstruction
+- silent zeroing of matrix elements
 
 ----------------------------------------
 
@@ -187,13 +199,13 @@ This avoids:
     patchsets, Γ_bare
 
 - Module 3 → computes:
-    dΓ/dT from current Γ
+    dΓ/dT from Γ
 
 - Module 4 → updates:
-    channel representation of Γ
+    full vertex Γ
 
 - Module 2 → analyzes:
-    channel kernels at selected steps
+    kernels reconstructed from Γ
 
 ----------------------------------------
 
@@ -206,14 +218,14 @@ This avoids:
 
 Vertex structure:
 
-- Stored in reduced channel form
-- Only 6 spin-conserving spin blocks retained
+- Full vertex stored explicitly
+- Only 6 spin-conserving blocks retained
 - Forbidden spin sectors set to zero
 
 Momentum treatment:
 
 - Patch discretization on FS
-- Transfer momenta discretized from patch combinations
+- Transfer momenta generated from patch combinations
 - All momenta treated modulo reciprocal lattice vectors
 
 ----------------------------------------
@@ -222,5 +234,7 @@ Momentum treatment:
 
 - Spin is treated explicitly
 - Momentum routing is fixed and consistent across modules
+- Channel decomposition is used only for:
+    diagram evaluation and diagnosis
 - The pipeline is designed for:
-    correctness first → then performance → then extensibility
+    correctness → consistency → extensibility → performance

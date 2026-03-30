@@ -952,6 +952,11 @@ InternalCache = Dict[Tuple[str, str], Dict[str, np.ndarray]]
 ShiftMap = Tuple[np.ndarray, np.ndarray]
 
 
+def _coerce_shift_map(shift_map: ShiftMap) -> ShiftMap:
+    partner, residual = shift_map
+    return np.asarray(partner, dtype=int), np.asarray(residual, dtype=float)
+
+
 def build_pp_internal_cache_vec(
     patchsets: PatchSetMap,
     Q: Sequence[float],
@@ -969,8 +974,7 @@ def build_pp_internal_cache_vec(
             partner, residual = shift_cache[(sa, sb)]
         else:
             partner, residual = shifted_patch_map(patchsets, sb, Q, mode="Q_minus_k")
-        partner = np.asarray(partner, dtype=int)
-        residual = np.asarray(residual, dtype=float)
+        partner, residual = _coerce_shift_map((partner, residual))
         weights = np.zeros_like(eps_a, dtype=complex)
         valid = partner >= 0
         if np.any(valid):
@@ -1001,8 +1005,7 @@ def build_ph_internal_cache_vec(
             partner, residual = shift_cache[(sa, sb)]
         else:
             partner, residual = shifted_patch_map(patchsets, sb, Q, mode="k_plus_Q")
-        partner = np.asarray(partner, dtype=int)
-        residual = np.asarray(residual, dtype=float)
+        partner, residual = _coerce_shift_map((partner, residual))
         weights = np.zeros_like(eps_a, dtype=complex)
         valid = partner >= 0
         if np.any(valid):
@@ -1056,10 +1059,8 @@ def compute_pp_kernel_fast2(
     if internal_cache is None:
         internal_cache = build_pp_internal_cache_vec(patchsets, Q, config)
 
-    partner_in = np.asarray(partner_in, dtype=int)
-    resid_in = np.asarray(resid_in, dtype=float)
-    partner_out = np.asarray(partner_out, dtype=int)
-    resid_out = np.asarray(resid_out, dtype=float)
+    partner_in, resid_in = _coerce_shift_map((partner_in, resid_in))
+    partner_out, resid_out = _coerce_shift_map((partner_out, resid_out))
 
     N = ps_in.Npatch
     K = np.zeros((N, N), dtype=complex)
@@ -1154,10 +1155,8 @@ def compute_ph_kernel_fast2(
     if internal_cache is None:
         internal_cache = build_ph_internal_cache_vec(patchsets, Q, config)
 
-    kplus_in = np.asarray(kplus_in, dtype=int)
-    resid_in = np.asarray(resid_in, dtype=float)
-    kplus_out = np.asarray(kplus_out, dtype=int)
-    resid_out = np.asarray(resid_out, dtype=float)
+    kplus_in, resid_in = _coerce_shift_map((kplus_in, resid_in))
+    kplus_out, resid_out = _coerce_shift_map((kplus_out, resid_out))
 
     N = ps1.Npatch
     K = np.zeros((N, N), dtype=complex)
@@ -1278,10 +1277,8 @@ def compute_phc_kernel_fast2(
     if internal_cache is None:
         internal_cache = build_ph_internal_cache_vec(patchsets, Q, config)
 
-    kplus_out = np.asarray(kplus_out, dtype=int)
-    resid_out = np.asarray(resid_out, dtype=float)
-    kminus_in = np.asarray(kminus_in, dtype=int)
-    resid_in = np.asarray(resid_in, dtype=float)
+    kplus_out, resid_out = _coerce_shift_map((kplus_out, resid_out))
+    kminus_in, resid_in = _coerce_shift_map((kminus_in, resid_in))
 
     N = ps1.Npatch
     K = np.zeros((N, N), dtype=complex)

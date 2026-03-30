@@ -1,62 +1,29 @@
-import numpy as np
-from dataclasses import dataclass
-from typing import Dict, Mapping, Sequence, Tuple, Union
+from __future__ import annotations
 
-from frg_kernel import normalize_spin as _normalize_spin_global, partner_map_from_q_index
+from dataclasses import dataclass
+from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
+
+import numpy as np
+
+from frg_kernel import normalize_spin, has_patchset, patchset_for_spin, partner_map_from_q_index, canonicalize_q_for_patchsets
 
 SpinLike = Union[str, int]
 PatchSetMap = Mapping[SpinLike, object]
-
-
-
-def _canonicalize_q_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
-    ref_spin = None
-    for s in ('up', 'dn'):
-        try:
-            ps = patchsets[s]
-            if ps is not None and getattr(ps, 'Npatch', len(getattr(ps, 'patches', []))) > 0:
-                ref_spin = s
-                break
-        except Exception:
-            continue
-    if ref_spin is None:
-        return np.asarray(q, dtype=float)
-    ps = patchsets[ref_spin]
-    b1 = np.asarray(ps.b1, dtype=float)
-    b2 = np.asarray(ps.b2, dtype=float)
-    B = np.column_stack([b1, b2])
-    uv = np.linalg.solve(B, np.asarray(q, dtype=float))
-    uv = uv - np.floor(uv)
-    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-    q_can = B @ uv
-    q_can[np.isclose(q_can, 0.0, atol=1e-12)] = 0.0
-    return q_can
-
-
-def _reduced_coords_for_patchsets(patchsets: PatchSetMap, q: Sequence[float]) -> np.ndarray:
-    q_can = _canonicalize_q_for_patchsets(patchsets, q)
-    ref_spin = "up" if "up" in patchsets else next(iter(patchsets.keys()))
-    ps = patchsets[ref_spin]
-    B = np.column_stack([np.asarray(ps.b1, dtype=float), np.asarray(ps.b2, dtype=float)])
-    uv = np.linalg.solve(B, np.asarray(q_can, dtype=float))
-    uv = uv - np.floor(uv)
-    uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-    uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-    return uv
-
-
-def _reduced_periodic_distance(uv_a: np.ndarray, uv_b: np.ndarray) -> float:
-    duv = np.asarray(uv_a, dtype=float) - np.asarray(uv_b, dtype=float)
-    duv = duv - np.round(duv)
-    return float(np.linalg.norm(duv))
+GammaAccessor = callable
 
 
 @dataclass
 class ChannelKernel:
+    """Patch-space kernel for a fixed transfer momentum Q and fixed external spin block.
+
+    The matrix acts on a momentum basis whose physical interpretation depends on the
+    channel:
+
+    - pp: basis state is a pair ``(k, Q-k)``
+    - ph: basis state is a bilinear ``k -> k+Q`` (direct) or ``k -> k-Q`` / ``k -> k+Q``
+      depending on the crossed routing
     """
-    Discrete patch-space kernel for one FRG channel at fixed transfer momentum Q.
-    """
+
     name: str
     Q: np.ndarray
     matrix: np.ndarray
@@ -81,21 +48,18 @@ class ChannelKernel:
             order = np.argsort(-np.abs(vals))
         elif sort_by == "real":
             order = np.argsort(-np.real(vals))
+        elif sort_by == "hermitian":
+            vals, vecs = np.linalg.eigh(0.5 * (self.matrix + self.matrix.conjugate().T))
+            order = np.argsort(-vals)
         else:
-            raise ValueError("sort_by must be 'abs' or 'real'.")
+            raise ValueError("sort_by must be 'abs', 'real', or 'hermitian'.")
         return vals[order], vecs[:, order]
-
 
 
 @dataclass
 class MotherChannelKernel:
-    """Mother kernel in patch ⊗ spin space.
+    """Tensor-product mother kernel in patch ⊗ spin(bilinear/pair) space."""
 
-    The matrix has shape (nspin_blocks * Npatch, nspin_blocks * Npatch).
-    `basis_labels` stores the spin-sector basis order, e.g. ("ud", "du") for
-    the pp Sz=0 mother channel or ("uu", "dd") for the longitudinal ph mother
-    channel.
-    """
     name: str
     Q: np.ndarray
     matrix: np.ndarray
@@ -135,7 +99,7 @@ class MotherChannelKernel:
         ir = self.basis_labels.index(row_label)
         ic = self.basis_labels.index(col_label)
         N = self.Npatch
-        return self.matrix[ir*N:(ir+1)*N, ic*N:(ic+1)*N]
+        return self.matrix[ir * N:(ir + 1) * N, ic * N:(ic + 1) * N]
 
 
 def assemble_mother_kernel(
@@ -158,8 +122,8 @@ def assemble_mother_kernel(
             ker = blocks[i][j]
             if ker.Npatch != N:
                 raise ValueError("All blocks must have the same patch dimension.")
-            matrix[i*N:(i+1)*N, j*N:(j+1)*N] = np.asarray(ker.matrix, dtype=complex)
-            residuals[i*N:(i+1)*N, j*N:(j+1)*N] = np.asarray(ker.residuals, dtype=float)
+            matrix[i * N:(i + 1) * N, j * N:(j + 1) * N] = np.asarray(ker.matrix, dtype=complex)
+            residuals[i * N:(i + 1) * N, j * N:(j + 1) * N] = np.asarray(ker.residuals, dtype=float)
     return MotherChannelKernel(
         name=name,
         Q=np.asarray(Q, dtype=float),
@@ -170,101 +134,106 @@ def assemble_mother_kernel(
     )
 
 
-class ChannelDecomposer:
-    r"""
-    Build patch-space kernels for pp / direct-ph / crossed-ph channels from the
-    antisymmetrized patch vertex provided by BareExtendedHubbard.
+class FullVertexChannelBuilder:
+    r"""Build mother kernels directly from the full antisymmetrized vertex.
 
-    Important conventions
+    Stored / input object
     ---------------------
-    1) particle-particle (pp)
-       incoming  : (k_in,  Q-k_in)
-       outgoing  : (k_out, Q-k_out)
+    The input ``gamma`` must be the *full* four-leg vertex accessor with convention
 
-       M_pp[out, in] = Gamma(k_in, Q-k_in -> k_out, Q-k_out)
+        (p1,s1), (p2,s2) -> (p3,s3), (p4,s4).
 
-    2) particle-hole direct (ph_direct)
-       incoming bilinear  : k_in  -> k_in + Q
-       outgoing bilinear  : k_out -> k_out + Q
+    This class never assumes that pp / phd / phc are stored pieces of the vertex.
+    They are used only as *external-leg routings* for constructing diagnosis kernels.
 
-       M_phd[out, in] = Gamma(k_in, k_out+Q -> k_in+Q, k_out)
+    Channel conventions
+    -------------------
+    1) pp pair basis at fixed Q:
+           in  = (k,   Q-k)
+           out = (k',  Q-k')
+       K_pp[out, in] = Γ(k, Q-k -> k', Q-k')
 
-    3) particle-hole crossed (ph_crossed)
-       incoming bilinear  : k_in  -> k_in - Q
-       outgoing bilinear  : k_out -> k_out + Q
+    2) ph direct bilinear basis at fixed Q:
+           in  = k   -> k+Q
+           out = k'  -> k'+Q
+       K_phd[out, in] = Γ(k, k'+Q -> k+Q, k')
 
-       M_phc[out, in] = Gamma(k_in, k_out -> k_out+Q, k_in-Q)
+    3) ph crossed bilinear basis at fixed Q:
+           in  = k   -> k-Q
+           out = k'  -> k'+Q
+       K_phc[out, in] = Γ(k, k' -> k'+Q, k-Q)
 
-    Notes
-    -----
-    - This class only does channel bookkeeping.
-    - It assumes the input vertex is already the antisymmetrized fermionic
-      vertex from interaction.patch_vertex(..., antisym=True).
-    - Shifted momenta like Q-k, k+Q, k-Q are matched to the nearest patch
-      modulo reciprocal lattice vectors.
+    The important point is that the ph basis is a bilinear basis, not a pp-like pair basis.
     """
 
-    def __init__(self, interaction, patchsets: PatchSetMap, *, q_merge_tol_red: float = 5e-3, q_key_decimals: int = 10):
-        self.interaction = interaction
+    def __init__(
+        self,
+        gamma,
+        patchsets: PatchSetMap,
+        *,
+        closure_map: Optional[Mapping[Tuple[str, str, str, str], Tuple[np.ndarray, np.ndarray]]] = None,
+        q_merge_tol_red: float = 5e-2,
+        q_key_decimals: int = 10,
+    ) -> None:
+        self.gamma = gamma
         self.patchsets = patchsets
+        if closure_map is None:
+            raise ValueError("FullVertexChannelBuilder requires closure_map from the flow solver; diagnosis must use the same p4 closure as the stored full vertex.")
+        self.closure_map = dict(closure_map)
         self.q_merge_tol_red = float(q_merge_tol_red)
         self.q_key_decimals = int(q_key_decimals)
-
-        # Early validation: avoid deep stack-trace failures later.
-        expected = int(self.interaction.Norb)
-        self._q_key_to_index = {}
-        self._q_values = []
-        self._q_uv_values = []
-        for spin, ps in patchsets.items():
-            if ps is None:
-                raise ValueError(f"patchsets['{spin}'] is None.")
-            if not hasattr(ps, "patches"):
-                raise ValueError(f"patchsets['{spin}'] does not look like a PatchSet.")
-            if len(ps.patches) == 0:
-                # empty patchsets are allowed to exist, but channels using them must be skipped
-                continue
-            u0 = np.asarray(ps.patches[0].eigvec)
-            if u0.shape != (expected,):
-                raise ValueError(
-                    f"patchsets['{spin}'] has eigvec shape {u0.shape}, "
-                    f"but interaction expects length-{expected} kagome eigenvectors."
-                )
+        self.spins = [s for s in ("up", "dn") if has_patchset(self.patchsets, s)]
+        if not self.spins:
+            raise ValueError("No non-empty spin patchsets found.")
+        self.Npatch = patchset_for_spin(self.patchsets, self.spins[0]).Npatch
+        for s in self.spins:
+            if patchset_for_spin(self.patchsets, s).Npatch != self.Npatch:
+                raise ValueError("FullVertexChannelBuilder requires identical patch counts across available spin sectors.")
+        self._patch_k = {
+            s: np.asarray([canonicalize_q_for_patchsets(self.patchsets, p.k_cart) for p in patchset_for_spin(self.patchsets, s).patches], dtype=float)
+            for s in self.spins
+        }
+        self._build_q_index_tables()
 
     def _build_q_index_tables(self) -> None:
-        spins = []
-        for s in ("up", "dn"):
-            try:
-                self._require_nonempty_patchset(s)
-                spins.append(s)
-            except Exception:
-                pass
-        self._pp_q_index = {}
-        self._phd_q_index = {}
-        self._phc_q_index = {}
-        for s1 in spins:
-            ps1 = self._require_nonempty_patchset(s1)
-            k1s = np.asarray([p.k_cart for p in ps1.patches], dtype=float)
-            for s2 in spins:
-                ps2 = self._require_nonempty_patchset(s2)
-                k2s = np.asarray([p.k_cart for p in ps2.patches], dtype=float)
-                arr_pp = np.zeros((ps1.Npatch, ps2.Npatch), dtype=int)
-                arr_ph = np.zeros((ps1.Npatch, ps2.Npatch), dtype=int)
-                for p1, k1 in enumerate(k1s):
-                    for p2, k2 in enumerate(k2s):
+        self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._ph_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phc_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._q_rep_uv: list[np.ndarray] = []
+        self._q_key_to_index: Dict[Tuple[float, float], int] = {}
+
+        for s1 in self.spins:
+            for s2 in self.spins:
+                arr_pp = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                arr_ph = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                for p1, k1 in enumerate(self._patch_k[s1]):
+                    for p2, k2 in enumerate(self._patch_k[s2]):
                         arr_pp[p1, p2] = self._q_nearest_index(k1 + k2)
                         arr_ph[p1, p2] = self._q_nearest_index(k1 - k2)
                 self._pp_q_index[(s1, s2)] = arr_pp
-                self._phd_q_index[(s1, s2)] = arr_ph
+                self._ph_q_index[(s1, s2)] = arr_ph
                 self._phc_q_index[(s1, s2)] = arr_ph.copy()
 
+    def _uv(self, q: Sequence[float]) -> np.ndarray:
+        q_can = canonicalize_q_for_patchsets(self.patchsets, q)
+        ps = patchset_for_spin(self.patchsets, self.spins[0])
+        B = np.column_stack([np.asarray(ps.b1, dtype=float), np.asarray(ps.b2, dtype=float)])
+        uv = np.linalg.solve(B, np.asarray(q_can, dtype=float))
+        uv = uv - np.floor(uv)
+        uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
+        uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
+        return uv
 
-    def _q_key(self, q: np.ndarray) -> Tuple[float, float]:
-        uv = _reduced_coords_for_patchsets(self.patchsets, q)
-        return tuple(np.round(uv, self.q_key_decimals))
+    def _q_key(self, q: Sequence[float]) -> Tuple[float, float]:
+        return tuple(np.round(self._uv(q), self.q_key_decimals))
 
-    def _find_q_rep_index(self, uv: np.ndarray):
-        if len(self._q_uv_values) == 0:
-            return None
+    @staticmethod
+    def _uv_distance(uv_a: np.ndarray, uv_b: np.ndarray) -> float:
+        duv = np.asarray(uv_a, dtype=float) - np.asarray(uv_b, dtype=float)
+        duv = duv - np.round(duv)
+        return float(np.linalg.norm(duv))
+
+    def _find_matching_rep(self, uv: np.ndarray) -> Optional[int]:
         key = tuple(np.round(np.asarray(uv, dtype=float), self.q_key_decimals))
         if key in self._q_key_to_index:
             return int(self._q_key_to_index[key])
@@ -272,171 +241,105 @@ class ChannelDecomposer:
             return None
         best_idx = None
         best_dist = np.inf
-        for irep, uv_rep in enumerate(self._q_uv_values):
-            dist = _reduced_periodic_distance(uv, uv_rep)
+        for irep, uv_rep in enumerate(self._q_rep_uv):
+            dist = self._uv_distance(uv, uv_rep)
             if dist <= self.q_merge_tol_red and (
-                dist < best_dist - 1e-14
-                or (abs(dist - best_dist) <= 1e-14 and (best_idx is None or irep < best_idx))
+                dist < best_dist - 1e-14 or (abs(dist - best_dist) <= 1e-14 and (best_idx is None or irep < best_idx))
             ):
                 best_idx = int(irep)
                 best_dist = float(dist)
         return best_idx
 
+    def _q_nearest_index(self, q: Sequence[float]) -> int:
+        q_can = canonicalize_q_for_patchsets(self.patchsets, q)
+        uv = self._uv(q_can)
+        idx = self._find_matching_rep(uv)
+        if idx is not None:
+            return int(idx)
+        idx = len(self._q_rep_uv)
+        self._q_rep_uv.append(uv)
+        self._q_key_to_index[tuple(np.round(uv, self.q_key_decimals))] = idx
+        return int(idx)
 
-    def _q_nearest_index(self, q: np.ndarray) -> int:
-        q_can = _canonicalize_q_for_patchsets(self.patchsets, q)
-        uv = _reduced_coords_for_patchsets(self.patchsets, q_can)
-        key = tuple(np.round(uv, self.q_key_decimals))
-        if key in self._q_key_to_index:
-            return int(self._q_key_to_index[key])
-
-        irep = self._find_q_rep_index(uv)
-        if irep is not None:
-            return int(irep)
-
-        irep = len(self._q_values)
-        self._q_key_to_index[key] = irep
-        self._q_values.append(q_can)
-        self._q_uv_values.append(uv)
-        return int(irep)
-
-    def normalize_spin(self, spin: SpinLike) -> str:
-        return self.interaction.normalize_spin(spin)
-
-    def _patchset_for_spin(self, spin: SpinLike):
-        ps = self.interaction._patchset_for_spin(self.patchsets, spin)
-        return ps
-
-    def _require_nonempty_patchset(self, spin: SpinLike):
-        ps = self._patchset_for_spin(spin)
-        if ps.Npatch == 0:
-            raise ValueError(
-                f"patchset for spin='{spin}' is empty. "
-                "This usually means that spin sector does not cross the Fermi surface, "
-                "so channels involving it cannot be constructed."
-            )
-        return ps
-
-    @staticmethod
-    def _minimum_image_displacement(k_target, k_ref, b1, b2):
-        k_target = np.asarray(k_target, dtype=float)
-        k_ref = np.asarray(k_ref, dtype=float)
-        b1 = np.asarray(b1, dtype=float)
-        b2 = np.asarray(b2, dtype=float)
-
-        best = None
-        best_norm = np.inf
-        for n1 in (-1, 0, 1):
-            for n2 in (-1, 0, 1):
-                disp = k_target - (k_ref + n1 * b1 + n2 * b2)
-                norm = float(np.linalg.norm(disp))
-                if norm < best_norm:
-                    best_norm = norm
-                    best = disp
-        return best
-
-    def find_shifted_patch_index(self, spin: SpinLike, k_target: np.ndarray):
-        """
-        Find nearest patch to k_target modulo reciprocal lattice vectors.
-        """
-        PS = self._require_nonempty_patchset(spin)
-        ks = np.array([p.k_cart for p in PS.patches], dtype=float)
-        dists = []
-        for k_ref in ks:
-            disp = self._minimum_image_displacement(k_target, k_ref, PS.b1, PS.b2)
-            dists.append(np.linalg.norm(disp))
-        dists = np.asarray(dists, dtype=float)
-        idx = int(np.argmin(dists))
-        return idx, float(dists[idx])
-
-    def shifted_patch_map(self, spin: SpinLike, Q: Sequence[float], *, mode: str):
-        """
-        Map each patch p to the nearest patch representing a shifted momentum.
-
-        mode:
-            'Q_minus_k' : target = Q - k
-            'k_plus_Q'  : target = k + Q
-            'k_minus_Q' : target = k - Q
-        """
-        Q = _canonicalize_q_for_patchsets(self.patchsets, Q)
-        PS = self._require_nonempty_patchset(spin)
-        idxs = np.zeros(PS.Npatch, dtype=int)
-        residuals = np.zeros(PS.Npatch, dtype=float)
-
-        for p, patch in enumerate(PS.patches):
-            k = np.asarray(patch.k_cart, dtype=float)
-            if mode == "Q_minus_k":
-                target = Q - k
-            elif mode == "k_plus_Q":
-                target = k + Q
-            elif mode == "k_minus_Q":
-                target = k - Q
-            else:
-                raise ValueError("mode must be one of {'Q_minus_k', 'k_plus_Q', 'k_minus_Q'}.")
-            idx, dist = self.find_shifted_patch_index(spin, target)
-            idxs[p] = idx
-            residuals[p] = dist
-
-        return idxs, residuals
-
-    def gamma(self, p1, s1, p2, s2, p3, s3, p4, s4):
-        return self.interaction.patch_vertex(
+    def _pp_partner(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
             self.patchsets,
-            p1, s1,
-            p2, s2,
-            p3, s3,
-            p4, s4,
-            antisym=True,
-            check_momentum=False,
+            self._pp_q_index[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=canonicalize_q_for_patchsets(self.patchsets, Q),
+            mode="Q_minus_k",
         )
 
-    def gamma_tensor(self, s1, s2, s3, s4):
-        return self.interaction.patch_tensor(
-            self.patchsets, s1, s2, s3, s4, antisym=True, enforce_momentum=False
+    def _ph_partner(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._ph_q_index[(normalize_spin(second_spin), normalize_spin(first_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=canonicalize_q_for_patchsets(self.patchsets, Q),
+            mode="k_plus_Q",
         )
 
-    def pp_kernel(self, Q, *, incoming_spins=("up", "dn"), outgoing_spins=None):
-        Q = _canonicalize_q_for_patchsets(self.patchsets, Q)
-        s1, s2 = map(self.normalize_spin, incoming_spins)
-        if outgoing_spins is None:
+    def _phc_partner(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float], mode: str):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._phc_q_index[(normalize_spin(second_spin), normalize_spin(first_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=canonicalize_q_for_patchsets(self.patchsets, Q),
+            mode=mode,
+        )
+
+    def _stored_p4(self, s1: str, s2: str, s3: str, s4: str, p1: int, p2: int, p3: int) -> int:
+        key = (normalize_spin(s1), normalize_spin(s2), normalize_spin(s3), normalize_spin(s4))
+        entry = self.closure_map.get(key)
+        if entry is None:
+            raise KeyError(f"Missing closure_map entry for spin block {key}.")
+        p4_idx = entry[0]
+        return int(p4_idx[p1, p2, p3])
+
+    def _stored_p4_residual(self, s1: str, s2: str, s3: str, s4: str, p1: int, p2: int, p3: int) -> float:
+        key = (normalize_spin(s1), normalize_spin(s2), normalize_spin(s3), normalize_spin(s4))
+        entry = self.closure_map.get(key)
+        if entry is None:
+            raise KeyError(f"Missing closure_map entry for spin block {key}.")
+        p4_res = entry[1]
+        return float(p4_res[p1, p2, p3])
+
+    def pp_block(self, Q: Sequence[float], *, incoming_pair: Tuple[SpinLike, SpinLike], outgoing_pair: Optional[Tuple[SpinLike, SpinLike]] = None) -> ChannelKernel:
+        Q = canonicalize_q_for_patchsets(self.patchsets, Q)
+        s1, s2 = map(normalize_spin, incoming_pair)
+        if outgoing_pair is None:
             s3, s4 = s1, s2
         else:
-            s3, s4 = map(self.normalize_spin, outgoing_spins)
-
-        PS_in = self._require_nonempty_patchset(s1)
-        PS_out = self._require_nonempty_patchset(s3)
-        self._require_nonempty_patchset(s2)
-        self._require_nonempty_patchset(s4)
-
-        if PS_in.Npatch != PS_out.Npatch:
-            raise ValueError("For pp kernel, first-leg incoming/outgoing patch counts must match.")
-
+            s3, s4 = map(normalize_spin, outgoing_pair)
         iq = self._q_nearest_index(Q)
-        partner_in, resid_in = partner_map_from_q_index(self.patchsets, self._pp_q_index[(s1, s2)], source_spin=s1, target_spin=s2, iq_target=iq, Q=Q, mode="Q_minus_k")
-        partner_out, resid_out = partner_map_from_q_index(self.patchsets, self._pp_q_index[(s3, s4)], source_spin=s3, target_spin=s4, iq_target=iq, Q=Q, mode="Q_minus_k")
+        partner_in, resid_in = self._pp_partner(iq, first_spin=s1, second_spin=s2, Q=Q)
+        partner_out, resid_out = self._pp_partner(iq, first_spin=s3, second_spin=s4, Q=Q)
 
-        N = PS_in.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        rows = np.arange(N, dtype=int)
-        cols = np.arange(N, dtype=int)
-
-        for pout in range(N):
-            p4 = int(partner_out[pout])
-            for pin in range(N):
+        M = np.zeros((self.Npatch, self.Npatch), dtype=complex)
+        residuals = np.zeros((self.Npatch, self.Npatch), dtype=float)
+        for pout in range(self.Npatch):
+            p4_partner = int(partner_out[pout])
+            for pin in range(self.Npatch):
                 p2 = int(partner_in[pin])
-                if p2 >= 0 and p4 >= 0:
-                    M[pout, pin] = self.gamma(pin, s1, p2, s2, pout, s3, p4, s4)
+                if p2 >= 0:
+                    p4 = self._stored_p4(s1, s2, s3, s4, pin, p2, pout)
+                    if int(p4) == p4_partner and int(p4) >= 0:
+                        M[pout, pin] = self.gamma(pin, s1, p2, s2, pout, s3, int(p4), s4)
+                    residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]), self._stored_p4_residual(s1, s2, s3, s4, pin, p2, pout))
                 else:
-                    M[pout, pin] = 0.0
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-
+                    residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return ChannelKernel(
-            name="pp",
-            Q=Q,
+            name="pp_raw",
+            Q=np.asarray(Q, dtype=float),
             matrix=M,
-            row_patches=rows,
-            col_patches=cols,
+            row_patches=np.arange(self.Npatch, dtype=int),
+            col_patches=np.arange(self.Npatch, dtype=int),
             row_partner_patches=np.asarray(partner_out, dtype=int),
             col_partner_patches=np.asarray(partner_in, dtype=int),
             row_spins=(s3, s4),
@@ -444,48 +347,33 @@ class ChannelDecomposer:
             residuals=residuals,
         )
 
-    def ph_direct_kernel(self, Q, *, incoming_spins=("up", "up"), outgoing_spins=None):
-        Q = _canonicalize_q_for_patchsets(self.patchsets, Q)
-        s1, s2 = map(self.normalize_spin, incoming_spins)
-        if outgoing_spins is None:
-            s3, s4 = s1, s2
+    def phd_block(self, Q: Sequence[float], *, incoming_bilinear: Tuple[SpinLike, SpinLike], outgoing_bilinear: Optional[Tuple[SpinLike, SpinLike]] = None) -> ChannelKernel:
+        Q = canonicalize_q_for_patchsets(self.patchsets, Q)
+        s1, s3 = map(normalize_spin, incoming_bilinear)
+        if outgoing_bilinear is None:
+            s4, s2 = s1, s3
         else:
-            s3, s4 = map(self.normalize_spin, outgoing_spins)
-
-        PS1 = self._require_nonempty_patchset(s1)
-        PS4 = self._require_nonempty_patchset(s4)
-        self._require_nonempty_patchset(s2)
-        self._require_nonempty_patchset(s3)
-
-        if PS1.Npatch != PS4.Npatch:
-            raise ValueError("For ph-direct kernel, row/col patch counts must match.")
-
+            s4, s2 = map(normalize_spin, outgoing_bilinear)
         iq = self._q_nearest_index(Q)
-        kplus_in, resid_in = partner_map_from_q_index(self.patchsets, self._phd_q_index[(s3, s1)], source_spin=s1, target_spin=s3, iq_target=iq, Q=Q, mode="k_plus_Q")
-        kplus_out, resid_out = partner_map_from_q_index(self.patchsets, self._phd_q_index[(s2, s4)], source_spin=s4, target_spin=s2, iq_target=iq, Q=Q, mode="k_plus_Q")
+        kplus_in, resid_in = self._ph_partner(iq, first_spin=s1, second_spin=s3, Q=Q)
+        kplus_out, resid_out = self._ph_partner(iq, first_spin=s4, second_spin=s2, Q=Q)
 
-        N = PS1.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        rows = np.arange(N, dtype=int)
-        cols = np.arange(N, dtype=int)
-
-        for pout in range(N):
+        M = np.zeros((self.Npatch, self.Npatch), dtype=complex)
+        residuals = np.zeros((self.Npatch, self.Npatch), dtype=float)
+        for pout in range(self.Npatch):
             p2 = int(kplus_out[pout])
-            for pin in range(N):
+            for pin in range(self.Npatch):
                 p3 = int(kplus_in[pin])
-                if p2 >= 0 and p3 >= 0:
+                p4_expected = self._stored_p4(s1, s2, s3, s4, pin, p2, p3) if (p2 >= 0 and p3 >= 0) else None
+                if p2 >= 0 and p3 >= 0 and int(p4_expected) == pout:
                     M[pout, pin] = self.gamma(pin, s1, p2, s2, p3, s3, pout, s4)
-                else:
-                    M[pout, pin] = 0.0
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-
+                residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]), self._stored_p4_residual(s1, s2, s3, s4, pin, p2, p3) if (p2 >= 0 and p3 >= 0) else 0.0)
         return ChannelKernel(
-            name="ph_direct",
-            Q=Q,
+            name="phd_raw",
+            Q=np.asarray(Q, dtype=float),
             matrix=M,
-            row_patches=rows,
-            col_patches=cols,
+            row_patches=np.arange(self.Npatch, dtype=int),
+            col_patches=np.arange(self.Npatch, dtype=int),
             row_partner_patches=np.asarray(kplus_out, dtype=int),
             col_partner_patches=np.asarray(kplus_in, dtype=int),
             row_spins=(s4, s2),
@@ -493,48 +381,33 @@ class ChannelDecomposer:
             residuals=residuals,
         )
 
-    def ph_crossed_kernel(self, Q, *, incoming_spins=("up", "up"), outgoing_spins=None):
-        Q = _canonicalize_q_for_patchsets(self.patchsets, Q)
-        s1, s2 = map(self.normalize_spin, incoming_spins)
-        if outgoing_spins is None:
+    def phc_block(self, Q: Sequence[float], *, incoming_bilinear: Tuple[SpinLike, SpinLike], outgoing_bilinear: Optional[Tuple[SpinLike, SpinLike]] = None) -> ChannelKernel:
+        Q = canonicalize_q_for_patchsets(self.patchsets, Q)
+        s1, s2 = map(normalize_spin, incoming_bilinear)
+        if outgoing_bilinear is None:
             s3, s4 = s2, s1
         else:
-            s3, s4 = map(self.normalize_spin, outgoing_spins)
-
-        PS1 = self._require_nonempty_patchset(s1)
-        PS2 = self._require_nonempty_patchset(s2)
-        self._require_nonempty_patchset(s3)
-        self._require_nonempty_patchset(s4)
-
-        if PS1.Npatch != PS2.Npatch:
-            raise ValueError("For ph-crossed kernel, first and second spin patch counts must match.")
-
+            s3, s4 = map(normalize_spin, outgoing_bilinear)
         iq = self._q_nearest_index(Q)
-        kplus_out, resid_out = partner_map_from_q_index(self.patchsets, self._phc_q_index[(s3, s2)], source_spin=s2, target_spin=s3, iq_target=iq, Q=Q, mode="k_plus_Q")
-        kminus_in, resid_in = partner_map_from_q_index(self.patchsets, self._phc_q_index[(s1, s4)], source_spin=s1, target_spin=s4, iq_target=iq, Q=Q, mode="k_minus_Q")
+        kplus_out, resid_out = self._phc_partner(iq, first_spin=s2, second_spin=s3, Q=Q, mode="k_plus_Q")
+        kminus_in, resid_in = self._phc_partner(iq, first_spin=s1, second_spin=s4, Q=Q, mode="k_minus_Q")
 
-        N = PS1.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        rows = np.arange(N, dtype=int)
-        cols = np.arange(N, dtype=int)
-
-        for pout in range(N):
+        M = np.zeros((self.Npatch, self.Npatch), dtype=complex)
+        residuals = np.zeros((self.Npatch, self.Npatch), dtype=float)
+        for pout in range(self.Npatch):
             p3 = int(kplus_out[pout])
-            for pin in range(N):
+            for pin in range(self.Npatch):
                 p4 = int(kminus_in[pin])
-                if p3 >= 0 and p4 >= 0:
+                p4_expected = self._stored_p4(s1, s2, s3, s4, pin, pout, p3) if (p3 >= 0 and p4 >= 0) else None
+                if p3 >= 0 and p4 >= 0 and int(p4_expected) == p4:
                     M[pout, pin] = self.gamma(pin, s1, pout, s2, p3, s3, p4, s4)
-                else:
-                    M[pout, pin] = 0.0
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-
+                residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]), self._stored_p4_residual(s1, s2, s3, s4, pin, pout, p3) if (p3 >= 0 and p4 >= 0) else 0.0)
         return ChannelKernel(
-            name="ph_crossed",
-            Q=Q,
+            name="phc_raw",
+            Q=np.asarray(Q, dtype=float),
             matrix=M,
-            row_patches=rows,
-            col_patches=cols,
+            row_patches=np.arange(self.Npatch, dtype=int),
+            col_patches=np.arange(self.Npatch, dtype=int),
             row_partner_patches=np.asarray(kplus_out, dtype=int),
             col_partner_patches=np.asarray(kminus_in, dtype=int),
             row_spins=(s2, s3),
@@ -542,205 +415,76 @@ class ChannelDecomposer:
             residuals=residuals,
         )
 
-    def pp_spin_blocks(self, Q) -> Dict[str, ChannelKernel]:
-        out = {}
-
-        # mixed-spin blocks only if both sectors exist
-        try:
-            self._require_nonempty_patchset("up")
-            self._require_nonempty_patchset("dn")
-            out.update({
-                "ud_to_ud": self.pp_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn")),
-                "ud_to_du": self.pp_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("dn", "up")),
-                "du_to_ud": self.pp_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("up", "dn")),
-                "du_to_du": self.pp_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up")),
-            })
-        except ValueError:
-            pass
-
-        # same-spin blocks if available
-        try:
-            out["uu_to_uu"] = self.pp_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-        except ValueError:
-            pass
-
-        try:
-            out["dd_to_dd"] = self.pp_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-        except ValueError:
-            pass
-
-        if len(out) == 0:
-            raise ValueError("No valid pp spin blocks can be constructed from the current patchsets.")
-
-        return out
-
-    def pp_singlet_triplet_sz0(self, Q) -> Dict[str, ChannelKernel]:
-        """
-        Build Sz=0 singlet / triplet pp kernels by algebraic spin combination.
-
-        Requires both up and down patchsets to be nonempty.
-        """
-        blocks = self.pp_spin_blocks(Q)
-        required = ["ud_to_ud", "ud_to_du", "du_to_ud", "du_to_du"]
-        missing = [key for key in required if key not in blocks]
-        if missing:
-            raise ValueError(
-                "pp_singlet_triplet_sz0 requires both spin sectors to cross the Fermi surface. "
-                f"Missing blocks: {missing}"
-            )
-
-        K_ud_ud = blocks["ud_to_ud"].matrix
-        K_ud_du = blocks["ud_to_du"].matrix
-        K_du_ud = blocks["du_to_ud"].matrix
-        K_du_du = blocks["du_to_du"].matrix
-
-        singlet = 0.5 * (K_ud_ud - K_ud_du - K_du_ud + K_du_du)
-        triplet = 0.5 * (K_ud_ud + K_ud_du + K_du_ud + K_du_du)
-
-        template = blocks["ud_to_ud"]
-        singlet_kernel = ChannelKernel(
-            name="pp_singlet_sz0",
+    def build_pp_mother_sz0(self, Q: Sequence[float]) -> MotherChannelKernel:
+        if not (has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn")):
+            raise ValueError("pp Sz=0 mother kernel requires both up and dn patchsets.")
+        K_ud_ud = self.pp_block(Q, incoming_pair=("up", "dn"), outgoing_pair=("up", "dn"))
+        K_ud_du = self.pp_block(Q, incoming_pair=("up", "dn"), outgoing_pair=("dn", "up"))
+        K_du_ud = self.pp_block(Q, incoming_pair=("dn", "up"), outgoing_pair=("up", "dn"))
+        K_du_du = self.pp_block(Q, incoming_pair=("dn", "up"), outgoing_pair=("dn", "up"))
+        return assemble_mother_kernel(
+            name="pp_mother_sz0",
             Q=np.asarray(Q, dtype=float),
-            matrix=singlet,
-            row_patches=template.row_patches.copy(),
-            col_patches=template.col_patches.copy(),
-            row_partner_patches=template.row_partner_patches.copy(),
-            col_partner_patches=template.col_partner_patches.copy(),
-            row_spins=("S", "S"),
-            col_spins=("S", "S"),
-            residuals=template.residuals.copy(),
+            basis_labels=("ud", "du"),
+            blocks=[
+                [K_ud_ud, K_ud_du],
+                [K_du_ud, K_du_du],
+            ],
         )
-        triplet_kernel = ChannelKernel(
-            name="pp_triplet_sz0",
+
+    def build_ph_mother_longitudinal(self, Q: Sequence[float]) -> MotherChannelKernel:
+        if not (has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn")):
+            raise ValueError("longitudinal ph mother kernel requires both up and dn patchsets.")
+        # Basis labels are longitudinal bilinears: uu ≡ c†_up c_up, dd ≡ c†_dn c_dn
+        K_uu_uu = self.phd_block(Q, incoming_bilinear=("up", "up"), outgoing_bilinear=("up", "up"))
+        K_uu_dd = self.phd_block(Q, incoming_bilinear=("up", "up"), outgoing_bilinear=("dn", "dn"))
+        K_dd_uu = self.phd_block(Q, incoming_bilinear=("dn", "dn"), outgoing_bilinear=("up", "up"))
+        K_dd_dd = self.phd_block(Q, incoming_bilinear=("dn", "dn"), outgoing_bilinear=("dn", "dn"))
+        return assemble_mother_kernel(
+            name="ph_mother_longitudinal",
             Q=np.asarray(Q, dtype=float),
-            matrix=triplet,
-            row_patches=template.row_patches.copy(),
-            col_patches=template.col_patches.copy(),
-            row_partner_patches=template.row_partner_patches.copy(),
-            col_partner_patches=template.col_partner_patches.copy(),
-            row_spins=("T", "T"),
-            col_spins=("T", "T"),
-            residuals=template.residuals.copy(),
+            basis_labels=("uu", "dd"),
+            blocks=[
+                [K_uu_uu, K_uu_dd],
+                [K_dd_uu, K_dd_dd],
+            ],
         )
 
-        out = {
-            "singlet_sz0": singlet_kernel,
-            "triplet_sz0": triplet_kernel,
-        }
-        if "uu_to_uu" in blocks:
-            out["triplet_uu"] = blocks["uu_to_uu"]
-        if "dd_to_dd" in blocks:
-            out["triplet_dd"] = blocks["dd_to_dd"]
+    def build_raw_block_dict(self, Q: Sequence[float]) -> Dict[str, ChannelKernel]:
+        out: Dict[str, ChannelKernel] = {}
+        if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
+            out["pp_ud_to_ud"] = self.pp_block(Q, incoming_pair=("up", "dn"), outgoing_pair=("up", "dn"))
+            out["pp_ud_to_du"] = self.pp_block(Q, incoming_pair=("up", "dn"), outgoing_pair=("dn", "up"))
+            out["pp_du_to_ud"] = self.pp_block(Q, incoming_pair=("dn", "up"), outgoing_pair=("up", "dn"))
+            out["pp_du_to_du"] = self.pp_block(Q, incoming_pair=("dn", "up"), outgoing_pair=("dn", "up"))
+            out["phd_uu_to_uu"] = self.phd_block(Q, incoming_bilinear=("up", "up"), outgoing_bilinear=("up", "up"))
+            out["phd_uu_to_dd"] = self.phd_block(Q, incoming_bilinear=("up", "up"), outgoing_bilinear=("dn", "dn"))
+            out["phd_dd_to_uu"] = self.phd_block(Q, incoming_bilinear=("dn", "dn"), outgoing_bilinear=("up", "up"))
+            out["phd_dd_to_dd"] = self.phd_block(Q, incoming_bilinear=("dn", "dn"), outgoing_bilinear=("dn", "dn"))
+        if has_patchset(self.patchsets, "up"):
+            out["pp_uu_to_uu"] = self.pp_block(Q, incoming_pair=("up", "up"), outgoing_pair=("up", "up"))
+            out["phc_uu"] = self.phc_block(Q, incoming_bilinear=("up", "up"), outgoing_bilinear=("up", "up"))
+        if has_patchset(self.patchsets, "dn"):
+            out["pp_dd_to_dd"] = self.pp_block(Q, incoming_pair=("dn", "dn"), outgoing_pair=("dn", "dn"))
+            out["phc_dd"] = self.phc_block(Q, incoming_bilinear=("dn", "dn"), outgoing_bilinear=("dn", "dn"))
         return out
 
-    def ph_longitudinal_blocks(self, Q) -> Dict[str, ChannelKernel]:
-        """
-        Raw longitudinal direct-ph blocks in the physical {up, dn} basis.
-
-        These are the ingredients needed to form charge / spin bilinears in the
-        {rho, sz} basis.  In particular, the mixed blocks
-
-            uu -> dd,   dd -> uu
-
-        must be retained; using only the diagonal same-spin blocks can
-        artificially suppress the longitudinal spin channel in SU(2)-symmetric
-        benchmarks.
-        """
-        Q = _canonicalize_q_for_patchsets(self.patchsets, Q)
-        K_uu_uu = self.ph_direct_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-        K_uu_dd = self.ph_direct_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
-        K_dd_uu = self.ph_direct_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up"))
-        K_dd_dd = self.ph_direct_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-        return {
-            "uu_to_uu": K_uu_uu,
-            "uu_to_dd": K_uu_dd,
-            "dd_to_uu": K_dd_uu,
-            "dd_to_dd": K_dd_dd,
-        }
-
-    def ph_charge_spin_longitudinal(self, Q) -> Dict[str, ChannelKernel]:
-        """
-        Longitudinal charge / spin kernels in the {rho, sz} bilinear basis.
-
-        Correct combinations:
-
-            K_rho = 0.5 * (K_uu->uu + K_uu->dd + K_dd->uu + K_dd->dd)
-            K_sz  = 0.5 * (K_uu->uu - K_uu->dd - K_dd->uu + K_dd->dd)
-
-        We also return the raw blocks for debugging.
-        """
-        blocks = self.ph_longitudinal_blocks(Q)
-        K_uu_uu = blocks["uu_to_uu"]
-        K_uu_dd = blocks["uu_to_dd"]
-        K_dd_uu = blocks["dd_to_uu"]
-        K_dd_dd = blocks["dd_to_dd"]
-
-        charge = 0.5 * (
-            K_uu_uu.matrix + K_uu_dd.matrix + K_dd_uu.matrix + K_dd_dd.matrix
-        )
-        spin = 0.5 * (
-            K_uu_uu.matrix - K_uu_dd.matrix - K_dd_uu.matrix + K_dd_dd.matrix
-        )
-        residuals = np.maximum.reduce([
-            K_uu_uu.residuals,
-            K_uu_dd.residuals,
-            K_dd_uu.residuals,
-            K_dd_dd.residuals,
-        ])
-
-        def _make(name: str, matrix: np.ndarray, tag: str) -> ChannelKernel:
-            return ChannelKernel(
-                name=name,
-                Q=np.asarray(Q, dtype=float),
-                matrix=np.asarray(matrix, dtype=complex),
-                row_patches=K_uu_uu.row_patches.copy(),
-                col_patches=K_uu_uu.col_patches.copy(),
-                row_partner_patches=K_uu_uu.row_partner_patches.copy(),
-                col_partner_patches=K_uu_uu.col_partner_patches.copy(),
-                row_spins=(tag, tag),
-                col_spins=(tag, tag),
-                residuals=np.asarray(residuals, dtype=float),
-            )
-
-        return {
-            "charge": _make("ph_charge_longitudinal", charge, "rho"),
-            "spin": _make("ph_spin_longitudinal", spin, "sz"),
-            **blocks,
-        }
-
-    def build_all_basic_channels(self, Q) -> Dict[str, ChannelKernel]:
-        out = {}
-        try:
-            out["pp_ud"] = self.pp_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
-        except ValueError:
-            pass
-        try:
-            out["phd_uu"] = self.ph_direct_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-        except ValueError:
-            pass
-        try:
-            out["phd_dd"] = self.ph_direct_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-        except ValueError:
-            pass
-        try:
-            out["phc_uu"] = self.ph_crossed_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-        except ValueError:
-            pass
-        try:
-            out["phc_dd"] = self.ph_crossed_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-        except ValueError:
-            pass
-        if len(out) == 0:
-            raise ValueError("No valid basic channels can be constructed from the current patchsets.")
+    def build_mother_kernel_dict(self, Q: Sequence[float]) -> Dict[str, MotherChannelKernel]:
+        out: Dict[str, MotherChannelKernel] = {}
+        if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
+            out["pp_mother_sz0"] = self.build_pp_mother_sz0(Q)
+            out["ph_mother_longitudinal"] = self.build_ph_mother_longitudinal(Q)
         return out
 
-    def summarize(self, kernel: ChannelKernel) -> Dict[str, float]:
-        vals, _ = kernel.eig(sort_by="abs")
-        return {
-            "Npatch": float(kernel.Npatch),
-            "max_patch_match_residual": float(np.max(kernel.residuals)),
-            "mean_patch_match_residual": float(np.mean(kernel.residuals)),
-            "hermitian_residual": float(kernel.hermitian_residual()),
-            "largest_abs_eigenvalue": float(np.abs(vals[0])) if len(vals) else 0.0,
-            "largest_real_part": float(np.max(np.real(vals))) if len(vals) else 0.0,
-        }
+
+# Backward-compatible alias.
+ChannelDecomposer = FullVertexChannelBuilder
+
+
+__all__ = [
+    "ChannelKernel",
+    "MotherChannelKernel",
+    "assemble_mother_kernel",
+    "FullVertexChannelBuilder",
+    "ChannelDecomposer",
+]
