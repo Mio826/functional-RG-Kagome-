@@ -23,10 +23,18 @@ class BareExtendedHubbard:
         H_int = U \sum_{R,a} n_{R a \uparrow} n_{R a \downarrow}
               + V \sum_{<R a, R' b>} n_{R a} n_{R' b}.
 
-    Because the interaction is density-density, the raw direct bare process is
-    spin-conserving along each fermion line,
+    Important consequence for spin scattering
+    -----------------------------------------
+    Because the interaction is density-density, it does *not* flip spin. The
+    allowed bare process is therefore spin-conserving along each fermion line,
 
         s3 = s1,   s4 = s2.
+
+    However, that does *not* mean one should keep only opposite-spin scattering:
+
+      - onsite U contributes only for opposite spins,
+      - nearest-neighbor V contributes for both opposite-spin and same-spin
+        scattering, because n_i n_j contains all spin combinations.
 
     Vertex conventions
     ------------------
@@ -37,8 +45,8 @@ class BareExtendedHubbard:
     where each u_i is a three-component Bloch eigenvector in the kagome orbital
     basis.
 
-    Exposed interfaces
-    ------------------
+    Two related vertices are exposed:
+
       1. direct_band_vertex(...)
          The raw density-density matrix element V_dir(1,2 -> 3,4).
 
@@ -47,18 +55,8 @@ class BareExtendedHubbard:
 
              Gamma(1,2 -> 3,4) = V_dir(1,2 -> 3,4) - V_dir(1,2 -> 4,3).
 
-      3. band_vertex_sz0(...) / patch_vertex_sz0(...)
-         PRL-compatible minimal S_z = 0 scalar vertex in the exchanged ordering
-
-             V_sz0(1,2;3,4) ≡ Gamma_{up,dn -> dn,up}(1,2 -> 3,4).
-
-         This is the convention used by the PRL notation
-
-             V(k1,k2;k3,k4) c^\dagger_{k4,s} c^\dagger_{k3,\bar s}
-                              c_{k2,\bar s} c_{k1,s}
-
-         where the outgoing spins are (s3,s4) = (dn,up) for incoming
-         (s1,s2) = (up,dn).
+         This is the object that should be passed to channel decomposition and
+         later FRG flow equations.
     """
 
     U: float
@@ -124,7 +122,7 @@ class BareExtendedHubbard:
 
         with q = k3 - k1.
 
-        This is the direct density-density matrix element. It is intentionally
+        This is the *direct* density-density matrix element. It is intentionally
         not antisymmetrized under exchange of outgoing legs.
         """
         s1 = self.normalize_spin(s1)
@@ -245,6 +243,9 @@ class BareExtendedHubbard:
         Fermionic antisymmetrized vertex
 
             Gamma(1,2 -> 3,4) = V_dir(1,2 -> 3,4) - V_dir(1,2 -> 4,3).
+
+        With the present density-density direct matrix element, this is the
+        natural vertex to use in Cooper / particle-hole channel analysis.
         """
         if check_momentum:
             if b1 is None or b2 is None:
@@ -268,57 +269,14 @@ class BareExtendedHubbard:
         return direct - exchange
 
     def band_vertex(self, *args, antisym: bool = True, **kwargs) -> complex:
+        r"""Backward-compatible wrapper.
+
+        By default this returns the antisymmetrized fermionic vertex.
+        Set ``antisym=False`` to obtain the raw direct matrix element instead.
+        """
         if antisym:
             return self.antisym_band_vertex(*args, **kwargs)
         return self.direct_band_vertex(*args, **kwargs)
-
-    # ------------------------------------------------------------------
-    # Minimal S_z = 0 interface for PRL-style flow
-    # ------------------------------------------------------------------
-
-    def band_vertex_sz0(
-        self,
-        k1: np.ndarray,
-        u1: np.ndarray,
-        k2: np.ndarray,
-        u2: np.ndarray,
-        k3: np.ndarray,
-        u3: np.ndarray,
-        k4: np.ndarray,
-        u4: np.ndarray,
-        *,
-        check_momentum: bool = False,
-        b1: Optional[np.ndarray] = None,
-        b2: Optional[np.ndarray] = None,
-        tol: float = 1e-7,
-        antisym: bool = True,
-    ) -> complex:
-        r"""
-        PRL-compatible minimal S_z=0 scalar object.
-
-        Convention
-        ----------
-        We define
-
-            V_sz0(1,2;3,4) ≡ Gamma_{up,dn -> dn,up}(1,2 -> 3,4)
-
-        i.e. the exchanged outgoing-spin ordering used in the PRL notation.
-        Since the underlying density-density interaction is direct and does not
-        itself allow up,dn -> dn,up as a raw direct process, the meaningful bare
-        object here is the antisymmetrized vertex. Therefore antisym=True is the
-        correct default and should normally not be changed.
-        """
-        return self.band_vertex(
-            k1, u1, "up",
-            k2, u2, "dn",
-            k3, u3, "dn",
-            k4, u4, "up",
-            antisym=antisym,
-            check_momentum=check_momentum,
-            b1=b1,
-            b2=b2,
-            tol=tol,
-        )
 
     def _patchset_for_spin(self, patchsets: PatchSetMap, spin: SpinLike):
         s = self.normalize_spin(spin)
@@ -349,6 +307,15 @@ class BareExtendedHubbard:
         antisym: bool = True,
         check_momentum: bool = False,
     ) -> complex:
+        r"""
+        Vertex evaluated on four patch representatives.
+
+        Parameters
+        ----------
+        antisym : bool, default True
+            Whether to return the fermionic antisymmetrized vertex Gamma or the
+            raw direct matrix element V_dir.
+        """
         PS1 = self._patchset_for_spin(patchsets, s1)
         PS2 = self._patchset_for_spin(patchsets, s2)
         PS3 = self._patchset_for_spin(patchsets, s3)
@@ -370,45 +337,6 @@ class BareExtendedHubbard:
             b2=PS1.b2,
         )
 
-    def patch_vertex_sz0(
-        self,
-        patchsets: PatchSetMap,
-        p1: int,
-        p2: int,
-        p3: int,
-        p4: int,
-        *,
-        antisym: bool = True,
-        check_momentum: bool = False,
-    ) -> complex:
-        r"""
-        Patch-level PRL-compatible minimal S_z=0 scalar object.
-
-            V_sz0(p1,p2;p3,p4) ≡ Gamma_{up,dn -> dn,up}(p1,p2 -> p3,p4)
-
-        with antisym=True by default.
-        """
-        PS1 = self._patchset_for_spin(patchsets, "up")
-        PS2 = self._patchset_for_spin(patchsets, "dn")
-        PS3 = self._patchset_for_spin(patchsets, "dn")
-        PS4 = self._patchset_for_spin(patchsets, "up")
-
-        P1 = PS1.patches[p1]
-        P2 = PS2.patches[p2]
-        P3 = PS3.patches[p3]
-        P4 = PS4.patches[p4]
-
-        return self.band_vertex_sz0(
-            P1.k_cart, P1.eigvec,
-            P2.k_cart, P2.eigvec,
-            P3.k_cart, P3.eigvec,
-            P4.k_cart, P4.eigvec,
-            antisym=antisym,
-            check_momentum=check_momentum,
-            b1=PS1.b1,
-            b2=PS1.b2,
-        )
-
     def patch_tensor(
         self,
         patchsets: PatchSetMap,
@@ -420,6 +348,24 @@ class BareExtendedHubbard:
         antisym: bool = True,
         enforce_momentum: bool = False,
     ) -> np.ndarray:
+        r"""
+        Build the full patch vertex tensor for a fixed spin sector.
+
+        This returns either
+
+            V[p1,p2,p3,p4]
+
+        or
+
+            Gamma[p1,p2,p3,p4],
+
+        depending on ``antisym``.
+
+        Notes
+        -----
+        This scales as O(Npatch^4) and is intended for debugging or small patch
+        numbers only.
+        """
         PS1 = self._patchset_for_spin(patchsets, s1)
         PS2 = self._patchset_for_spin(patchsets, s2)
         PS3 = self._patchset_for_spin(patchsets, s3)
@@ -445,50 +391,6 @@ class BareExtendedHubbard:
                                 check_momentum=enforce_momentum,
                                 b1=PS1.b1,
                                 b2=PS1.b2,
-                            )
-                        except ValueError:
-                            out[p1, p2, p3, p4] = 0.0
-        return out
-
-    def patch_tensor_sz0(
-        self,
-        patchsets: PatchSetMap,
-        *,
-        antisym: bool = True,
-        enforce_momentum: bool = False,
-    ) -> np.ndarray:
-        r"""
-        Build the minimal S_z=0 patch tensor
-
-            V_sz0[p1,p2,p3,p4] = Gamma_{up,dn -> dn,up}(p1,p2 -> p3,p4)
-
-        with antisym=True by default.
-        """
-        PSu = self._patchset_for_spin(patchsets, "up")
-        PSd = self._patchset_for_spin(patchsets, "dn")
-        N = PSu.Npatch
-        if PSd.Npatch != N:
-            raise ValueError("patch_tensor_sz0 requires equal up/dn patch counts.")
-
-        out = np.zeros((N, N, N, N), dtype=complex)
-        for p1 in range(N):
-            P1 = PSu.patches[p1]
-            for p2 in range(N):
-                P2 = PSd.patches[p2]
-                for p3 in range(N):
-                    P3 = PSd.patches[p3]
-                    for p4 in range(N):
-                        P4 = PSu.patches[p4]
-                        try:
-                            out[p1, p2, p3, p4] = self.band_vertex_sz0(
-                                P1.k_cart, P1.eigvec,
-                                P2.k_cart, P2.eigvec,
-                                P3.k_cart, P3.eigvec,
-                                P4.k_cart, P4.eigvec,
-                                antisym=antisym,
-                                check_momentum=enforce_momentum,
-                                b1=PSu.b1,
-                                b2=PSu.b2,
                             )
                         except ValueError:
                             out[p1, p2, p3, p4] = 0.0

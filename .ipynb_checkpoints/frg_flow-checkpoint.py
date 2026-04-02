@@ -1,214 +1,48 @@
-
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, List, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 
-try:
-    from channels import ChannelKernel
-except Exception:
-    @dataclass
-    class ChannelKernel:
-        name: str
-        Q: np.ndarray
-        matrix: np.ndarray
-        row_patches: np.ndarray
-        col_patches: np.ndarray
-        row_partner_patches: np.ndarray
-        col_partner_patches: np.ndarray
-        row_spins: Tuple[str, str]
-        col_spins: Tuple[str, str]
-        residuals: np.ndarray
-
-        @property
-        def Npatch(self) -> int:
-            return int(self.matrix.shape[0])
-
-        def eig(self, sort_by: str = "abs"):
-            vals, vecs = np.linalg.eig(self.matrix)
-            if sort_by == "abs":
-                order = np.argsort(-np.abs(vals))
-            elif sort_by == "real":
-                order = np.argsort(-np.real(vals))
-            else:
-                raise ValueError("sort_by must be 'abs' or 'real'.")
-            return vals[order], vecs[:, order]
-
 from frg_kernel import (
     FlowConfig,
-    compute_pp_kernel_fast,
-    compute_ph_kernel_fast,
-    compute_phc_kernel_fast,
-    normalize_spin,
-    patchset_for_spin,
-    shifted_patch_map,
-    has_patchset,
-)
-
-
-from frg_kernel import (
-    available_internal_spin_pairs,
+    PatchSetMap,
+    TransferGrid,
     build_ph_internal_cache_vec,
     build_pp_internal_cache_vec,
-    compute_ph_kernel_fast2,
-    compute_phc_kernel_fast2,
-    compute_pp_kernel_fast2,
+    build_unique_q_list,
+    canonicalize_q_for_patchsets,
+    compute_phc_vertex_contribution_sz0,
+    compute_phd_vertex_contribution_sz0,
+    compute_pp_vertex_contribution_sz0,
+    has_patchset,
+    normalize_spin,
+    partner_map_from_q_index,
+    patchset_for_spin,
 )
-
-try:
-    from kagome_order_diagnosis import KagomeOrderDiagnoser
-except Exception:
-    KagomeOrderDiagnoser = None
-
-
-SpinLike = Union[str, int]
-PatchSetMap = Mapping[SpinLike, object]
-SpinBlock = Tuple[str, str, str, str]
-ChannelKey = Tuple[str, str, str, str, int]
-GammaAccessor = Callable[[int, str, int, str, int, str, int, str], complex]
-
-
-def canonical_spin_tuple(key: Tuple[SpinLike, SpinLike, SpinLike, SpinLike]) -> SpinBlock:
-    return tuple(normalize_spin(x) for x in key)  # type: ignore[return-value]
-
-
-def available_physical_spins(patchsets: PatchSetMap) -> List[str]:
-    out: List[str] = []
-    for s in ("up", "dn"):
-        if has_patchset(patchsets, s):
-            out.append(s)
-    if not out:
-        raise ValueError("No non-empty spin patch sets found.")
-    return out
-
-
-def default_spin_blocks(patchsets: PatchSetMap) -> List[SpinBlock]:
-    spins = available_physical_spins(patchsets)
-    blocks: List[SpinBlock] = []
-    if "up" in spins:
-        blocks.append(("up", "up", "up", "up"))
-    if "dn" in spins:
-        blocks.append(("dn", "dn", "dn", "dn"))
-    if set(spins) == {"up", "dn"}:
-        blocks.extend(
-            [
-                ("up", "dn", "up", "dn"),
-                ("up", "dn", "dn", "up"),
-                ("dn", "up", "up", "dn"),
-                ("dn", "up", "dn", "up"),
-            ]
-        )
-    return blocks
-
-
-class BareVertexFromInteraction:
-    def __init__(self, interaction: Any, patchsets: PatchSetMap):
-        self.interaction = interaction
-        self.patchsets = patchsets
-
-    def __call__(self, p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
-        return complex(
-            self.interaction.patch_vertex(
-                self.patchsets,
-                p1, s1,
-                p2, s2,
-                p3, s3,
-                p4, s4,
-                antisym=True,
-                check_momentum=False,
-            )
-        )
-
-
-def _reduced_coords(k: np.ndarray, b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
-    B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
-    return np.linalg.solve(B, np.asarray(k, dtype=float))
-
-
-def _wrap_reduced_coords_centered(uv: np.ndarray) -> np.ndarray:
-    uv = np.asarray(uv, dtype=float)
-    return uv - np.floor(uv + 0.5)
-
-
-def _canonicalize_q(q: Sequence[float], b1: np.ndarray, b2: np.ndarray) -> np.ndarray:
-    uv = _reduced_coords(np.asarray(q, dtype=float), b1, b2)
-    uv = _wrap_reduced_coords_centered(uv)
-    B = np.column_stack([np.asarray(b1, dtype=float), np.asarray(b2, dtype=float)])
-    return B @ uv
-
-
-class TransferGrid:
-    def __init__(self, patchsets: PatchSetMap, q_list: Sequence[Sequence[float]], *, decimals: int = 10):
-        ref_spin = available_physical_spins(patchsets)[0]
-        ps = patchset_for_spin(patchsets, ref_spin)
-        self.b1 = np.asarray(ps.b1, dtype=float)
-        self.b2 = np.asarray(ps.b2, dtype=float)
-        self.decimals = int(decimals)
-        self.q_list = [self.canonicalize(q) for q in q_list]
-        self.key_to_index: Dict[Tuple[float, float], int] = {}
-        for i, q in enumerate(self.q_list):
-            self.key_to_index[self.key(q)] = i
-
-    def canonicalize(self, q: Sequence[float]) -> np.ndarray:
-        return _canonicalize_q(q, self.b1, self.b2)
-
-    def key(self, q: Sequence[float]) -> Tuple[float, float]:
-        uv = _reduced_coords(self.canonicalize(q), self.b1, self.b2)
-        uv = _wrap_reduced_coords_centered(uv)
-        return tuple(np.round(uv, decimals=self.decimals))
-
-    def nearest_index(self, q: Sequence[float]) -> int:
-        q_can = self.canonicalize(q)
-        key = self.key(q_can)
-        if key in self.key_to_index:
-            return int(self.key_to_index[key])
-        dists = [np.linalg.norm(q_can - qq) for qq in self.q_list]
-        return int(np.argmin(dists))
-
-
-def build_unique_q_listdef build_unique_q_list(patchsets: PatchSetMap, *, mode: str, decimals: int = 10) -> List[np.ndarray]:
-    ref_spin = available_physical_spins(patchsets)[0]
-    ps = patchset_for_spin(patchsets, ref_spin)
-    ks = np.asarray([p.k_cart for p in ps.patches], dtype=float)
-    grid = TransferGrid(patchsets, [np.zeros(2, dtype=float)], decimals=decimals)
-    zero = grid.canonicalize(np.zeros(2, dtype=float))
-    seen: Dict[Tuple[float, float], np.ndarray] = {grid.key(zero): zero}
-
-    if mode == "pp":
-        for k1 in ks:
-            for k2 in ks:
-                q = grid.canonicalize(k1 + k2)
-                seen.setdefault(grid.key(q), q)
-    elif mode in {"ph", "phc"}:
-        for k1 in ks:
-            for k3 in ks:
-                q = grid.canonicalize(k3 - k1)
-                seen.setdefault(grid.key(q), q)
-    else:
-        raise ValueError("mode must be one of {'pp', 'ph', 'phc'}")
-    return list(seen.values())
 
 
 @dataclass
-class FRGState:
+class SZ0Tensor:
+    """Store V(p1,p2,p3) with p4 determined by closure map."""
+    data: np.ndarray
+    p4_index: np.ndarray
+    p4_residual: np.ndarray
+
+
+@dataclass
+class SZ0FlowState:
     patchsets: PatchSetMap
-    bare_gamma: GammaAccessor
+    bare_vertex: Callable[[int, int, int, int], complex]
     pp_grid: TransferGrid
     phd_grid: TransferGrid
     phc_grid: TransferGrid
-    spin_blocks: List[SpinBlock]
     T: float
-    pp_corr: Dict[ChannelKey, np.ndarray] = field(default_factory=dict)
-    phd_corr: Dict[ChannelKey, np.ndarray] = field(default_factory=dict)
-    phc_corr: Dict[ChannelKey, np.ndarray] = field(default_factory=dict)
+    vertex: SZ0Tensor
 
     def channel_norm(self) -> float:
-        vals: List[float] = []
-        for store in (self.pp_corr, self.phd_corr, self.phc_corr):
-            vals.extend([float(np.max(np.abs(v))) for v in store.values() if v.size])
-        return max(vals) if vals else 0.0
+        return float(np.max(np.abs(self.vertex.data))) if self.vertex.data.size else 0.0
 
 
 @dataclass
@@ -224,10 +58,6 @@ class FlowStepRecord:
     instability_reason: Optional[str] = None
     terminated_early: bool = False
     termination_reason: Optional[str] = None
-    leading_channel_name: Optional[str] = None
-    leading_Q: Optional[np.ndarray] = None
-    leading_eigenvalue_abs: Optional[float] = None
-    leading_order_label: Optional[str] = None
     diagnosis_payload: Dict[str, Any] = field(default_factory=dict)
 
     def summary_dict(self) -> Dict[str, Any]:
@@ -243,45 +73,46 @@ class FlowStepRecord:
             "instability_reason": self.instability_reason,
             "terminated_early": bool(self.terminated_early),
             "termination_reason": self.termination_reason,
-            "leading_channel_name": self.leading_channel_name,
-            "leading_Q": None if self.leading_Q is None else np.asarray(self.leading_Q, dtype=float).tolist(),
-            "leading_eigenvalue_abs": None if self.leading_eigenvalue_abs is None else float(self.leading_eigenvalue_abs),
-            "leading_order_label": self.leading_order_label,
-            "diagnosis_payload": self.diagnosis_payload,
+            "diagnosis_payload": dict(self.diagnosis_payload),
         }
 
 
-@dataclass
-class FastVertexEvaluator:
-    solver: "FRGFlowSolver"
+class BareSZ0VertexFromInteraction:
+    """
+    Adapter for a PRL-compatible minimal S_z=0 bare vertex.
 
-    def __call__(self, p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
-        slv = self.solver
-        s1n, s2n, s3n, s4n = canonical_spin_tuple((s1, s2, s3, s4))
-        val = complex(slv.state.bare_gamma(p1, s1n, p2, s2n, p3, s3n, p4, s4n))
+    Convention:
+        V(1,2;3,4) = Gamma_{up,dn -> dn,up}(1,2;3,4)
+    """
+    def __init__(self, interaction: Any, patchsets: PatchSetMap):
+        self.interaction = interaction
+        self.patchsets = patchsets
 
-        iq_pp = slv._pp_q_index[(s1n, s2n)][p1, p2]
-        val += complex(slv.state.pp_corr[(s1n, s2n, s3n, s4n, iq_pp)][p3, p1])
+    def __call__(self, p1: int, p2: int, p3: int, p4: int) -> complex:
+        if hasattr(self.interaction, "patch_vertex_sz0"):
+            return complex(self.interaction.patch_vertex_sz0(self.patchsets, p1, p2, p3, p4))
+        return complex(
+            self.interaction.patch_vertex(
+                self.patchsets,
+                p1, "up",
+                p2, "dn",
+                p3, "dn",
+                p4, "up",
+                antisym=False,
+                check_momentum=False,
+            )
+        )
 
-        iq_phd = slv._phd_q_index[(s3n, s1n)][p3, p1]
-        val += complex(slv.state.phd_corr[(s1n, s2n, s3n, s4n, iq_phd)][p4, p1])
 
-        iq_phc = slv._phc_q_index[(s3n, s2n)][p3, p2]
-        val += complex(slv.state.phc_corr[(s1n, s2n, s3n, s4n, iq_phc)][p2, p1])
-        return val
-
-
-class FRGFlowSolver:
+class FRGFlowSolverSZ0:
     def __init__(
         self,
         *,
         patchsets: PatchSetMap,
-        bare_gamma: GammaAccessor,
-        spin_blocks: Optional[Sequence[Tuple[SpinLike, SpinLike, SpinLike, SpinLike]]] = None,
+        bare_vertex: Callable[[int, int, int, int], complex],
         pp_Qs: Optional[Sequence[Sequence[float]]] = None,
         ph_Qs: Optional[Sequence[Sequence[float]]] = None,
         phc_Qs: Optional[Sequence[Sequence[float]]] = None,
-        diagnoser: Optional[Any] = None,
         T_start: float = 0.5,
         T_stop: float = 0.02,
         n_steps: int = 24,
@@ -291,130 +122,75 @@ class FRGFlowSolver:
         max_relative_update: float = 0.15,
         min_substep_fraction: float = 1.0 / 128.0,
         channel_divergence_threshold: float = 1e3,
-        eigenvalue_threshold: float = 1e2,
         diagnose_every: int = 1,
-        diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
-        diagnosis_sort_by: str = "abs",
-        track_crossed_channel: bool = True,
+        q_merge_tol_red: float = 5e-2,
+        q_key_decimals: int = 10,
     ) -> None:
         self.patchsets = patchsets
-        self.bare_gamma = bare_gamma
-        self.spin_blocks = [canonical_spin_tuple(x) for x in (spin_blocks or default_spin_blocks(patchsets))]
-        self.allowed_spin_blocks = frozenset(self.spin_blocks)
+        self.bare_vertex = bare_vertex
+        self.q_merge_tol_red = float(q_merge_tol_red)
+        self.q_key_decimals = int(q_key_decimals)
 
         if pp_Qs is None:
-            pp_Qs = build_unique_q_list(patchsets, mode="pp")
+            pp_Qs = build_unique_q_list(patchsets, mode="pp", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
         if ph_Qs is None:
-            ph_Qs = build_unique_q_list(patchsets, mode="ph")
+            ph_Qs = build_unique_q_list(patchsets, mode="ph", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
         if phc_Qs is None:
-            phc_Qs = build_unique_q_list(patchsets, mode="phc")
+            phc_Qs = build_unique_q_list(patchsets, mode="phc", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
 
-        self.pp_grid = TransferGrid(patchsets, pp_Qs)
-        self.phd_grid = TransferGrid(patchsets, ph_Qs)
-        self.phc_grid = TransferGrid(patchsets, phc_Qs)
-
-        self.diagnoser = diagnoser if diagnoser is not None else (
-            KagomeOrderDiagnoser(patchsets_by_spin=patchsets) if KagomeOrderDiagnoser is not None else None
-        )
+        self.pp_grid = TransferGrid(patchsets, list(pp_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
+        self.phd_grid = TransferGrid(patchsets, list(ph_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
+        self.phc_grid = TransferGrid(patchsets, list(phc_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
 
         self.T_start = float(T_start)
         self.T_stop = float(T_stop)
         if self.T_start <= self.T_stop:
             raise ValueError("Require T_start > T_stop for a descending temperature flow.")
         self.n_steps = int(n_steps)
-        if self.n_steps < 2:
-            raise ValueError("n_steps must be at least 2.")
         self.temperature_grid = str(temperature_grid).lower()
-        if self.temperature_grid not in {"log", "linear"}:
-            raise ValueError("temperature_grid must be 'log' or 'linear'.")
-
         self.nfreq = int(nfreq)
         self.include_explicit_T_prefactor = bool(include_explicit_T_prefactor)
         self.max_relative_update = float(max_relative_update)
         self.min_substep_fraction = float(min_substep_fraction)
         self.channel_divergence_threshold = float(channel_divergence_threshold)
-        self.eigenvalue_threshold = float(eigenvalue_threshold)
         self.diagnose_every = int(diagnose_every)
-        self.diagnosis_sort_by = str(diagnosis_sort_by)
-        self.track_crossed_channel = bool(track_crossed_channel)
 
-        if diagnosis_Qs is None:
-            self.diagnosis_Qs = [self.phd_grid.canonicalize(q) for q in self.phd_grid.q_list]
-        else:
-            self.diagnosis_Qs = [self.phd_grid.canonicalize(q) for q in diagnosis_Qs]
+        self._spins = ("up", "dn")
+        self._validate_patch_counts()
+        self.Npatch = patchset_for_spin(self.patchsets, "up").Npatch
+        self._patch_k = {
+            s: np.asarray(
+                [canonicalize_q_for_patchsets(self.patchsets, p.k_cart) for p in patchset_for_spin(self.patchsets, s).patches],
+                dtype=float,
+            )
+            for s in self._spins
+        }
 
-        self.state = FRGState(
+        self._precompute_transfer_tables()
+        self._precompute_closure_map_sz0()
+        self._precompute_shift_maps()
+
+        self.state = SZ0FlowState(
             patchsets=patchsets,
-            bare_gamma=bare_gamma,
+            bare_vertex=bare_vertex,
             pp_grid=self.pp_grid,
             phd_grid=self.phd_grid,
             phc_grid=self.phc_grid,
-            spin_blocks=list(self.spin_blocks),
             T=float(T_start),
-            pp_corr=self._empty_channel_store(self.pp_grid),
-            phd_corr=self._empty_channel_store(self.phd_grid),
-            phc_corr=self._empty_channel_store(self.phc_grid),
+            vertex=self._initialize_bare_vertex(),
         )
-
-        self._precompute_transfer_tables()
-        self._fast_gamma = FastVertexEvaluator(self)
+        self._fast_vertex = SZ0VertexAccessor(self)
         self.bare_vertex_norm = self._estimate_bare_vertex_norm()
-
         self.temperature_path = self._build_temperature_path()
         self.history: List[FlowStepRecord] = []
         self.instability_record: Optional[FlowStepRecord] = None
 
-    def _all_spins_present(self) -> List[str]:
-        return available_physical_spins(self.patchsets)
-
-    def _patch_k_array(self, spin: str) -> np.ndarray:
-        ps = patchset_for_spin(self.patchsets, spin)
-        return np.asarray([p.k_cart for p in ps.patches], dtype=float)
-
-    def _precompute_transfer_tables(self) -> None:
-        spins = self._all_spins_present()
-        self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
-        self._phd_q_index: Dict[Tuple[str, str], np.ndarray] = {}
-        self._phc_q_index: Dict[Tuple[str, str], np.ndarray] = {}
-
-        for s1 in spins:
-            k1s = self._patch_k_array(s1)
-            for s2 in spins:
-                k2s = self._patch_k_array(s2)
-                arr = np.zeros((len(k1s), len(k2s)), dtype=int)
-                for p1, k1 in enumerate(k1s):
-                    for p2, k2 in enumerate(k2s):
-                        arr[p1, p2] = self.pp_grid.nearest_index(k1 + k2)
-                self._pp_q_index[(s1, s2)] = arr
-
-        for s3 in spins:
-            k3s = self._patch_k_array(s3)
-            for s1 in spins:
-                k1s = self._patch_k_array(s1)
-                arr = np.zeros((len(k3s), len(k1s)), dtype=int)
-                for p3, k3 in enumerate(k3s):
-                    for p1, k1 in enumerate(k1s):
-                        arr[p3, p1] = self.phd_grid.nearest_index(k3 - k1)
-                self._phd_q_index[(s3, s1)] = arr
-
-        for s3 in spins:
-            k3s = self._patch_k_array(s3)
-            for s2 in spins:
-                k2s = self._patch_k_array(s2)
-                arr = np.zeros((len(k3s), len(k2s)), dtype=int)
-                for p3, k3 in enumerate(k3s):
-                    for p2, k2 in enumerate(k2s):
-                        arr[p3, p2] = self.phc_grid.nearest_index(k3 - k2)
-                self._phc_q_index[(s3, s2)] = arr
-
-    def _empty_channel_store(self, grid: TransferGrid) -> Dict[ChannelKey, np.ndarray]:
-        ref_spin = available_physical_spins(self.patchsets)[0]
-        Np = patchset_for_spin(self.patchsets, ref_spin).Npatch
-        out: Dict[ChannelKey, np.ndarray] = {}
-        for key in self.spin_blocks:
-            for iq in range(len(grid.q_list)):
-                out[(key[0], key[1], key[2], key[3], iq)] = np.zeros((Np, Np), dtype=complex)
-        return out
+    def _validate_patch_counts(self) -> None:
+        if not (has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn")):
+            raise ValueError("SZ0 flow requires both up and dn patchsets.")
+        counts = [patchset_for_spin(self.patchsets, s).Npatch for s in self._spins]
+        if len(set(counts)) != 1:
+            raise ValueError("SZ0 flow currently requires identical patch counts across up/dn patchsets.")
 
     def _flow_config(self, T: float) -> FlowConfig:
         return FlowConfig(
@@ -426,399 +202,211 @@ class FRGFlowSolver:
     def _build_temperature_path(self) -> np.ndarray:
         if self.temperature_grid == "log":
             return np.geomspace(self.T_start, self.T_stop, self.n_steps)
-        return np.linspace(self.T_start, self.T_stop, self.n_steps)
+        if self.temperature_grid == "linear":
+            return np.linspace(self.T_start, self.T_stop, self.n_steps)
+        raise ValueError("temperature_grid must be 'log' or 'linear'.")
 
-    def _channel_elem(self, store: Dict[ChannelKey, np.ndarray], key: ChannelKey, i: int, j: int) -> complex:
-        mat = store.get(key)
-        if mat is None:
-            return 0.0 + 0.0j
-        return complex(mat[i, j])
+    def _precompute_transfer_tables(self) -> None:
+        self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phd_q_index_plus: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phc_q_index_plus: Dict[Tuple[str, str], np.ndarray] = {}
+        self._phc_q_index_minus: Dict[Tuple[str, str], np.ndarray] = {}
 
-    def _estimate_bare_vertex_norm(self, sample_cap: int = 6) -> float:
-        ref_spin = available_physical_spins(self.patchsets)[0]
-        Np = patchset_for_spin(self.patchsets, ref_spin).Npatch
-        P = min(sample_cap, Np)
-        vals = []
-        for (s1, s2, s3, s4) in self.spin_blocks:
-            for p1 in range(P):
-                for p2 in range(P):
-                    for p3 in range(P):
-                        p4 = 0
-                        vals.append(abs(self.bare_gamma(p1, s1, p2, s2, p3, s3, p4, s4)))
-        if not vals:
-            return 1e-14
-        return max(float(np.max(vals)), 1e-14)
+        for s_src in self._spins:
+            ksrcs = self._patch_k[s_src]
+            for s_tgt in self._spins:
+                ktgts = self._patch_k[s_tgt]
+                arr_pp = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                arr_ph_plus = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                arr_ph_minus = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                for p_src, k_src in enumerate(ksrcs):
+                    for p_tgt, k_tgt in enumerate(ktgts):
+                        arr_pp[p_src, p_tgt] = self.pp_grid.nearest_index(k_src + k_tgt)
+                        arr_ph_plus[p_src, p_tgt] = self.phd_grid.nearest_index(k_tgt - k_src)
+                        arr_ph_minus[p_src, p_tgt] = self.phc_grid.nearest_index(k_src - k_tgt)
+                self._pp_q_index[(s_src, s_tgt)] = arr_pp
+                self._phd_q_index_plus[(s_src, s_tgt)] = arr_ph_plus
+                self._phc_q_index_plus[(s_src, s_tgt)] = arr_ph_plus.copy()
+                self._phc_q_index_minus[(s_src, s_tgt)] = arr_ph_minus
 
-    def gamma_accessor(self) -> GammaAccessor:
-        state = self.state
+    def _partner_map_pp_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._pp_q_index[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.pp_grid.canonicalize(Q),
+            mode="Q_minus_k",
+        )
 
-        def gamma(p1: int, s1: str, p2: int, s2: str, p3: int, s3: str, p4: int, s4: str) -> complex:
-            s1n, s2n, s3n, s4n = canonical_spin_tuple((s1, s2, s3, s4))
-            k1 = np.asarray(patchset_for_spin(state.patchsets, s1n).patches[p1].k_cart, dtype=float)
-            k2 = np.asarray(patchset_for_spin(state.patchsets, s2n).patches[p2].k_cart, dtype=float)
-            k3 = np.asarray(patchset_for_spin(state.patchsets, s3n).patches[p3].k_cart, dtype=float)
+    def _partner_map_phd_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        return partner_map_from_q_index(
+            self.patchsets,
+            self._phd_q_index_plus[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.phd_grid.canonicalize(Q),
+            mode="k_plus_Q",
+        )
 
-            val = complex(state.bare_gamma(p1, s1n, p2, s2n, p3, s3n, p4, s4n))
+    def _partner_map_phc_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float], mode: str):
+        table = self._phc_q_index_plus if mode == "k_plus_Q" else self._phc_q_index_minus
+        return partner_map_from_q_index(
+            self.patchsets,
+            table[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            source_spin=first_spin,
+            target_spin=second_spin,
+            iq_target=int(iq),
+            Q=self.phc_grid.canonicalize(Q),
+            mode=mode,
+        )
 
-            iq_pp = state.pp_grid.nearest_index(k1 + k2)
-            val += self._channel_elem(state.pp_corr, (s1n, s2n, s3n, s4n, iq_pp), p3, p1)
-
-            iq_phd = state.phd_grid.nearest_index(k3 - k1)
-            val += self._channel_elem(state.phd_corr, (s1n, s2n, s3n, s4n, iq_phd), p4, p1)
-
-            iq_phc = state.phc_grid.nearest_index(k3 - k2)
-            val += self._channel_elem(state.phc_corr, (s1n, s2n, s3n, s4n, iq_phc), p2, p1)
-
-            return complex(val)
-
-        return gamma
-
-    def _rhs_norm(self, rhs_pp, rhs_phd, rhs_phc) -> float:
-        vals: List[float] = []
-        for store in (rhs_pp, rhs_phd, rhs_phc):
-            vals.extend([float(np.max(np.abs(v))) for v in store.values() if v.size])
-        return max(vals) if vals else 0.0
-
-    def compute_channel_rhs(self, T: float):
-        gamma = self._fast_gamma
-        cfg = self._flow_config(T)
-
-        rhs_pp = self._empty_channel_store(self.pp_grid)
-        rhs_phd = self._empty_channel_store(self.phd_grid)
-        rhs_phc = self._empty_channel_store(self.phc_grid)
+    def _precompute_shift_maps(self) -> None:
+        self._pp_qminus: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self._ph_kplus: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
+        self._phc_kplus: Dict[int, Tuple[np.ndarray, np.ndarray]] = {}
 
         for iq, Q in enumerate(self.pp_grid.q_list):
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_pp_kernel_fast(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s2),
-                    outgoing_spins=(s3, s4),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                )
-                rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-
+            self._pp_qminus[iq] = self._partner_map_pp_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)
         for iq, Q in enumerate(self.phd_grid.q_list):
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_ph_kernel_fast(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s3),
-                    outgoing_spins=(s4, s2),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                )
-                rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-
+            self._ph_kplus[iq] = self._partner_map_phd_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)
         for iq, Q in enumerate(self.phc_grid.q_list):
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_phc_kernel_fast(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s2),
-                    outgoing_spins=(s3, s4),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                )
-                rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
+            self._phc_kplus[iq] = self._partner_map_phc_from_iq(iq, first_spin="up", second_spin="dn", Q=Q, mode="k_plus_Q")
 
-        return rhs_pp, rhs_phd, rhs_phc
+    def _precompute_closure_map_sz0(self) -> None:
+        s1, s2, s3, s4 = "up", "dn", "dn", "up"
+        p4_idx = np.full((self.Npatch, self.Npatch, self.Npatch), -1, dtype=int)
+        p4_res = np.full((self.Npatch, self.Npatch, self.Npatch), np.inf, dtype=float)
+        ks4 = self._patch_k[s4]
+        ps4 = patchset_for_spin(self.patchsets, s4)
+        b1 = np.asarray(ps4.b1, dtype=float)
+        b2 = np.asarray(ps4.b2, dtype=float)
 
-    def _vertex_pp_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
-        Q = self.pp_grid.canonicalize(np.asarray(Q, dtype=float))
-        gamma = self._fast_gamma
-        s1, s2 = map(normalize_spin, incoming_spins)
-        s3, s4 = map(normalize_spin, outgoing_spins)
-        ps_in = patchset_for_spin(self.patchsets, s1)
-        partner_in, resid_in = shifted_patch_map(self.patchsets, s2, Q, mode="Q_minus_k")
-        partner_out, resid_out = shifted_patch_map(self.patchsets, s4, Q, mode="Q_minus_k")
-        N = ps_in.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        for pout in range(N):
-            p4 = int(partner_out[pout])
-            for pin in range(N):
-                p2 = int(partner_in[pin])
-                M[pout, pin] = gamma(pin, s1, p2, s2, pout, s3, p4, s4)
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-        return ChannelKernel(
-            name="pp",
-            Q=Q,
-            matrix=M,
-            row_patches=np.arange(N, dtype=int),
-            col_patches=np.arange(N, dtype=int),
-            row_partner_patches=np.asarray(partner_out, dtype=int),
-            col_partner_patches=np.asarray(partner_in, dtype=int),
-            row_spins=(s3, s4),
-            col_spins=(s1, s2),
-            residuals=residuals,
-        )
+        for p1, k1 in enumerate(self._patch_k[s1]):
+            for p2, k2 in enumerate(self._patch_k[s2]):
+                total = canonicalize_q_for_patchsets(self.patchsets, k1 + k2)
+                for p3, k3 in enumerate(self._patch_k[s3]):
+                    target_k4 = canonicalize_q_for_patchsets(self.patchsets, total - k3)
+                    best_idx = 0
+                    best_norm = np.inf
+                    for i, k_ref in enumerate(ks4):
+                        local_best = np.inf
+                        for n1 in (-1, 0, 1):
+                            for n2 in (-1, 0, 1):
+                                disp = target_k4 - (k_ref + n1 * b1 + n2 * b2)
+                                nd = np.linalg.norm(disp)
+                                if nd < local_best:
+                                    local_best = nd
+                        if local_best < best_norm:
+                            best_norm = local_best
+                            best_idx = i
+                    p4_idx[p1, p2, p3] = int(best_idx)
+                    p4_res[p1, p2, p3] = float(best_norm)
 
-    def _vertex_phd_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
-        Q = self.phd_grid.canonicalize(np.asarray(Q, dtype=float))
-        gamma = self._fast_gamma
-        s1, s3 = map(normalize_spin, incoming_spins)
-        s4, s2 = map(normalize_spin, outgoing_spins)
-        ps1 = patchset_for_spin(self.patchsets, s1)
-        kplus_in, resid_in = shifted_patch_map(self.patchsets, s3, Q, mode="k_plus_Q")
-        kplus_out, resid_out = shifted_patch_map(self.patchsets, s2, Q, mode="k_plus_Q")
-        N = ps1.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        for pout in range(N):
-            p2 = int(kplus_out[pout])
-            for pin in range(N):
-                p3 = int(kplus_in[pin])
-                M[pout, pin] = gamma(pin, s1, p2, s2, p3, s3, pout, s4)
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-        return ChannelKernel(
-            name="ph_direct",
-            Q=Q,
-            matrix=M,
-            row_patches=np.arange(N, dtype=int),
-            col_patches=np.arange(N, dtype=int),
-            row_partner_patches=np.asarray(kplus_out, dtype=int),
-            col_partner_patches=np.asarray(kplus_in, dtype=int),
-            row_spins=(s4, s2),
-            col_spins=(s1, s3),
-            residuals=residuals,
-        )
+        self._closure_map = {(s1, s2, s3, s4): (p4_idx, p4_res)}
 
-    def _vertex_phc_kernel(self, Q: Sequence[float], *, incoming_spins: Tuple[str, str], outgoing_spins: Tuple[str, str]) -> ChannelKernel:
-        Q = self.phc_grid.canonicalize(np.asarray(Q, dtype=float))
-        gamma = self._fast_gamma
-        s1, s2 = map(normalize_spin, incoming_spins)
-        s3, s4 = map(normalize_spin, outgoing_spins)
-        ps1 = patchset_for_spin(self.patchsets, s1)
-        kplus_out, resid_out = shifted_patch_map(self.patchsets, s3, Q, mode="k_plus_Q")
-        kminus_in, resid_in = shifted_patch_map(self.patchsets, s4, Q, mode="k_minus_Q")
-        N = ps1.Npatch
-        M = np.zeros((N, N), dtype=complex)
-        residuals = np.zeros((N, N), dtype=float)
-        for pout in range(N):
-            p3 = int(kplus_out[pout])
-            for pin in range(N):
-                p4 = int(kminus_in[pin])
-                M[pout, pin] = gamma(pin, s1, pout, s2, p3, s3, p4, s4)
-                residuals[pout, pin] = max(resid_in[pin], resid_out[pout])
-        return ChannelKernel(
-            name="ph_crossed",
-            Q=Q,
-            matrix=M,
-            row_patches=np.arange(N, dtype=int),
-            col_patches=np.arange(N, dtype=int),
-            row_partner_patches=np.asarray(kplus_out, dtype=int),
-            col_partner_patches=np.asarray(kminus_in, dtype=int),
-            row_spins=(s2, s3),
-            col_spins=(s1, s4),
-            residuals=residuals,
-        )
+    def _initialize_bare_vertex(self) -> SZ0Tensor:
+        key = ("up", "dn", "dn", "up")
+        p4_idx, p4_res = self._closure_map[key]
+        data = np.zeros((self.Npatch, self.Npatch, self.Npatch), dtype=complex)
+        for p1 in range(self.Npatch):
+            for p2 in range(self.Npatch):
+                for p3 in range(self.Npatch):
+                    p4 = int(p4_idx[p1, p2, p3])
+                    if p4 >= 0:
+                        data[p1, p2, p3] = self.bare_vertex(p1, p2, p3, p4)
+        return SZ0Tensor(data=data, p4_index=p4_idx, p4_residual=p4_res)
 
-    def _make_combined_kernel(
-        self,
-        *,
-        name: str,
-        Q: np.ndarray,
-        template: ChannelKernel,
-        matrix: np.ndarray,
-        row_tag: str,
-        col_tag: str,
-        residuals: np.ndarray,
-    ) -> ChannelKernel:
-        return ChannelKernel(
-            name=name,
-            Q=np.asarray(Q, dtype=float),
-            matrix=np.asarray(matrix, dtype=complex),
-            row_patches=template.row_patches.copy(),
-            col_patches=template.col_patches.copy(),
-            row_partner_patches=template.row_partner_patches.copy(),
-            col_partner_patches=template.col_partner_patches.copy(),
-            row_spins=(row_tag, row_tag),
-            col_spins=(col_tag, col_tag),
-            residuals=np.asarray(residuals, dtype=float),
-        )
+    def _estimate_bare_vertex_norm(self) -> float:
+        return max(float(np.max(np.abs(self.state.vertex.data))), 1e-14)
 
-    def build_diagnosis_kernel_dict(self, Q: Sequence[float]) -> Dict[str, ChannelKernel]:
-        Q = self.phd_grid.canonicalize(np.asarray(Q, dtype=float))
-        out: Dict[str, ChannelKernel] = {}
+    def current_vertex_accessor(self) -> Callable[[int, int, int, int], complex]:
+        return self._fast_vertex
 
-        if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
-            K_ud_ud = self._vertex_pp_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
-            K_ud_du = self._vertex_pp_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("dn", "up"))
-            K_du_ud = self._vertex_pp_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("up", "dn"))
-            K_du_du = self._vertex_pp_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up"))
-            out["pp_ud_to_ud"] = K_ud_ud
-            out["pp_ud_to_du"] = K_ud_du
-            out["pp_du_to_ud"] = K_du_ud
-            out["pp_du_to_du"] = K_du_du
-
-            template = K_ud_ud
-            out["pp_singlet_sz0"] = self._make_combined_kernel(
-                name="pp_singlet_sz0",
-                Q=Q,
-                template=template,
-                matrix=0.5 * (K_ud_ud.matrix - K_ud_du.matrix - K_du_ud.matrix + K_du_du.matrix),
-                row_tag="S",
-                col_tag="S",
-                residuals=template.residuals.copy(),
+    def _build_q_level_internal_caches(self, T: float):
+        cfg = self._flow_config(T)
+        pp_internal_by_iq: Dict[int, Dict[Tuple[str, str], Dict[str, np.ndarray]]] = {}
+        ph_internal_by_iq: Dict[int, Dict[Tuple[str, str], Dict[str, np.ndarray]]] = {}
+        phc_internal_by_iq: Dict[int, Dict[Tuple[str, str], Dict[str, np.ndarray]]] = {}
+        for iq in range(len(self.pp_grid.q_list)):
+            pp_internal_by_iq[iq] = build_pp_internal_cache_vec(
+                self.patchsets, cfg, shift_cache={("up", "dn"): self._pp_qminus[iq]}
             )
-            out["pp_triplet_sz0"] = self._make_combined_kernel(
-                name="pp_triplet_sz0",
-                Q=Q,
-                template=template,
-                matrix=0.5 * (K_ud_ud.matrix + K_ud_du.matrix + K_du_ud.matrix + K_du_du.matrix),
-                row_tag="T",
-                col_tag="T",
-                residuals=template.residuals.copy(),
+        for iq in range(len(self.phd_grid.q_list)):
+            ph_internal_by_iq[iq] = build_ph_internal_cache_vec(
+                self.patchsets, cfg, shift_cache={("up", "dn"): self._ph_kplus[iq]}
             )
-
-        if has_patchset(self.patchsets, "up"):
-            out["pp_triplet_uu"] = self._vertex_pp_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-            out["phd_uu"] = self._vertex_phd_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-            if self.track_crossed_channel:
-                out["phc_uu"] = self._vertex_phc_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-
-        if has_patchset(self.patchsets, "dn"):
-            out["pp_triplet_dd"] = self._vertex_pp_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-            out["phd_dd"] = self._vertex_phd_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-            if self.track_crossed_channel:
-                out["phc_dd"] = self._vertex_phc_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-
-        if has_patchset(self.patchsets, "up") and has_patchset(self.patchsets, "dn"):
-            K_uu_uu = self._vertex_phd_kernel(Q, incoming_spins=("up", "up"), outgoing_spins=("up", "up"))
-            K_uu_dd = self._vertex_phd_kernel(Q, incoming_spins=("up", "dn"), outgoing_spins=("up", "dn"))
-            K_dd_uu = self._vertex_phd_kernel(Q, incoming_spins=("dn", "up"), outgoing_spins=("dn", "up"))
-            K_dd_dd = self._vertex_phd_kernel(Q, incoming_spins=("dn", "dn"), outgoing_spins=("dn", "dn"))
-            out["phd_uu_to_uu"] = K_uu_uu
-            out["phd_uu_to_dd"] = K_uu_dd
-            out["phd_dd_to_uu"] = K_dd_uu
-            out["phd_dd_to_dd"] = K_dd_dd
-
-            residuals = np.maximum.reduce([
-                K_uu_uu.residuals,
-                K_uu_dd.residuals,
-                K_dd_uu.residuals,
-                K_dd_dd.residuals,
-            ])
-            out["ph_charge_longitudinal"] = self._make_combined_kernel(
-                name="ph_charge_longitudinal",
-                Q=Q,
-                template=K_uu_uu,
-                matrix=0.5 * (K_uu_uu.matrix + K_uu_dd.matrix + K_dd_uu.matrix + K_dd_dd.matrix),
-                row_tag="rho",
-                col_tag="rho",
-                residuals=residuals,
+        for iq in range(len(self.phc_grid.q_list)):
+            phc_internal_by_iq[iq] = build_ph_internal_cache_vec(
+                self.patchsets, cfg, shift_cache={("up", "dn"): self._phc_kplus[iq]}
             )
-            out["ph_spin_longitudinal"] = self._make_combined_kernel(
-                name="ph_spin_longitudinal",
-                Q=Q,
-                template=K_uu_uu,
-                matrix=0.5 * (K_uu_uu.matrix - K_uu_dd.matrix - K_dd_uu.matrix + K_dd_dd.matrix),
-                row_tag="sz",
-                col_tag="sz",
-                residuals=residuals,
-            )
-        return out
+        return pp_internal_by_iq, ph_internal_by_iq, phc_internal_by_iq
+
+    def compute_vertex_rhs(self, T: float) -> np.ndarray:
+        pp_internal_by_iq, ph_internal_by_iq, phc_internal_by_iq = self._build_q_level_internal_caches(T)
+        rhs = np.zeros_like(self.state.vertex.data)
+        p4_idx = self.state.vertex.p4_index
+        qpp = self._pp_q_index[("up", "dn")]
+        qphd = self._phd_q_index_plus[("up", "dn")]
+        qphc = self._phc_q_index_plus[("dn", "dn")]
+
+        v_accessor = self.current_vertex_accessor()
+
+        for p1 in range(self.Npatch):
+            for p2 in range(self.Npatch):
+                pp_cache = pp_internal_by_iq[int(qpp[p1, p2])]
+                for p3 in range(self.Npatch):
+                    p4 = int(p4_idx[p1, p2, p3])
+                    if p4 < 0:
+                        continue
+
+                    # direct ph transfer: Q = k3 - k1 -> index[p1, p3]
+                    phd_cache = ph_internal_by_iq[int(qphd[p1, p3])]
+
+                    # crossed ph transfer: Q = k3 - k2 -> index[p2, p3]
+                    phc_cache = phc_internal_by_iq[int(qphc[p2, p3])]
+
+                    rhs[p1, p2, p3] = (
+                        compute_pp_vertex_contribution_sz0(v_accessor, p1=p1, p2=p2, p3=p3, p4=p4, internal_cache=pp_cache)
+                        + compute_phd_vertex_contribution_sz0(v_accessor, p1=p1, p2=p2, p3=p3, p4=p4, internal_cache=phd_cache)
+                        + compute_phc_vertex_contribution_sz0(v_accessor, p1=p1, p2=p2, p3=p3, p4=p4, internal_cache=phc_cache)
+                    )
+        return rhs
+
+    def _rhs_norm(self, rhs: np.ndarray) -> float:
+        return float(np.max(np.abs(rhs))) if rhs.size else 0.0
+
+    def _apply_rhs(self, rhs: np.ndarray, scale: float) -> None:
+        self.state.vertex.data += scale * np.asarray(rhs, dtype=complex)
 
     def diagnose_current_state(self) -> Dict[str, Any]:
-        preferred_names = {
-            "pp_singlet_sz0",
-            "pp_triplet_sz0",
-            "ph_charge_longitudinal",
-            "ph_spin_longitudinal",
+        return {
+            "representation": "sz0_minimal",
+            "stored_object": "V(p1,p2,p3; p4 via closure)",
+            "channel_norm": self.state.channel_norm(),
         }
-        fallback_prefixes = ("pp_triplet_", "phd_", "phc_")
-        best_abs_eval = -np.inf
-        best = {
-            "channel_name": None,
-            "Q": None,
-            "abs_eigenvalue": None,
-            "order_label": None,
-            "diagnosis": None,
-            "all_candidates": [],
-        }
-
-        candidates = []
-        for Q in self.diagnosis_Qs:
-            kernels = self.build_diagnosis_kernel_dict(Q)
-            preferred = [(name, ker) for name, ker in kernels.items() if name in preferred_names]
-            if preferred:
-                use = preferred
-            else:
-                use = [(name, ker) for name, ker in kernels.items() if name.startswith(fallback_prefixes)]
-
-            for name, kernel in use:
-                vals, _ = kernel.eig(sort_by=self.diagnosis_sort_by)
-                if len(vals) == 0:
-                    continue
-                lam = float(np.abs(vals[0]))
-                diag_summary = None
-                order_label = None
-                if self.diagnoser is not None:
-                    diag = self.diagnoser.diagnose_kernel(kernel, sort_by=self.diagnosis_sort_by)
-                    diag_summary = diag.summary_dict()
-                    order_label = diag.paper_label
-                candidate = {
-                    "channel_name": name,
-                    "Q": np.asarray(Q, dtype=float),
-                    "abs_eigenvalue": lam,
-                    "order_label": order_label,
-                    "diagnosis": diag_summary,
-                }
-                candidates.append(candidate)
-                if lam > best_abs_eval:
-                    best_abs_eval = lam
-                    best = dict(candidate)
-
-        candidates_sorted = sorted(candidates, key=lambda x: x["abs_eigenvalue"], reverse=True)
-        best["all_candidates"] = [
-            {
-                "channel_name": c["channel_name"],
-                "Q": c["Q"].tolist(),
-                "abs_eigenvalue": c["abs_eigenvalue"],
-                "order_label": c["order_label"],
-            }
-            for c in candidates_sorted
-        ]
-        return best
-
-    def _apply_rhs(self, rhs_pp, rhs_phd, rhs_phc, scale: float) -> None:
-        for key, mat in rhs_pp.items():
-            self.state.pp_corr[key] += scale * np.asarray(mat, dtype=complex)
-        for key, mat in rhs_phd.items():
-            self.state.phd_corr[key] += scale * np.asarray(mat, dtype=complex)
-        for key, mat in rhs_phc.items():
-            self.state.phc_corr[key] += scale * np.asarray(mat, dtype=complex)
 
     def check_instability(self, record: FlowStepRecord) -> Tuple[bool, Optional[str]]:
         if record.terminated_early:
             return True, record.termination_reason or "flow terminated early"
         if record.channel_norm >= self.channel_divergence_threshold:
             return True, f"channel norm={record.channel_norm:.3e} exceeded channel_divergence_threshold"
-        if record.leading_eigenvalue_abs is not None and record.leading_eigenvalue_abs >= self.eigenvalue_threshold:
-            return True, f"leading eigenvalue={record.leading_eigenvalue_abs:.3e} exceeded eigenvalue_threshold"
         return False, None
 
     def step(self, T_old: float, dT: float) -> FlowStepRecord:
-        rhs_pp, rhs_phd, rhs_phc = self.compute_channel_rhs(T_old)
-
+        rhs = self.compute_vertex_rhs(T_old)
         effective_norm = max(self.state.channel_norm(), self.bare_vertex_norm, 1e-14)
-        rhs_norm = self._rhs_norm(rhs_pp, rhs_phd, rhs_phc)
+        rhs_norm = self._rhs_norm(rhs)
         rel_update = abs(dT) * rhs_norm / effective_norm
-
         n_sub = max(1, int(np.ceil(rel_update / self.max_relative_update))) if rel_update > self.max_relative_update else 1
         if (1.0 / n_sub) < self.min_substep_fraction:
             attempted_T_new = float(T_old + dT)
             message = (
-                "Adaptive step control requested too many substeps; "
-                "stopping flow early and returning partial history. "
+                "Adaptive step control requested too many substeps; stopping flow early. "
                 f"Current state remains at T={float(T_old):.8f}, attempted T_new={attempted_T_new:.8f}, "
-                f"rhs_norm={rhs_norm:.3e}, rel_update={rel_update:.3e}, proposed_n_sub={n_sub}. "
-                "Reduce temperature spacing or relax max_relative_update to continue further."
+                f"rhs_norm={rhs_norm:.3e}, rel_update={rel_update:.3e}, proposed_n_sub={n_sub}."
             )
             return FlowStepRecord(
                 step_index=len(self.history),
@@ -830,14 +418,12 @@ class FRGFlowSolver:
                 max_rel_update=rel_update,
                 terminated_early=True,
                 termination_reason=message,
+                diagnosis_payload=self.diagnose_current_state(),
             )
-
         sub_dT = dT / n_sub
         for _ in range(n_sub):
-            self._apply_rhs(rhs_pp, rhs_phd, rhs_phc, sub_dT)
-
+            self._apply_rhs(rhs, sub_dT)
         self.state.T = float(T_old + dT)
-
         return FlowStepRecord(
             step_index=len(self.history),
             temperature=float(T_old + dT),
@@ -846,12 +432,11 @@ class FRGFlowSolver:
             rhs_norm=rhs_norm,
             accepted_substeps=n_sub,
             max_rel_update=rel_update / n_sub if n_sub > 0 else rel_update,
+            diagnosis_payload=self.diagnose_current_state(),
         )
 
     def run(self) -> List[FlowStepRecord]:
         temps = self.temperature_path
-
-        initial = self.diagnose_current_state()
         rec0 = FlowStepRecord(
             step_index=0,
             temperature=float(temps[0]),
@@ -860,175 +445,57 @@ class FRGFlowSolver:
             rhs_norm=0.0,
             accepted_substeps=0,
             max_rel_update=0.0,
-            leading_channel_name=initial.get("channel_name"),
-            leading_Q=initial.get("Q"),
-            leading_eigenvalue_abs=initial.get("abs_eigenvalue"),
-            leading_order_label=initial.get("order_label"),
-            diagnosis_payload=initial.get("diagnosis") or {},
+            diagnosis_payload=self.diagnose_current_state(),
         )
         rec0.instability, rec0.instability_reason = self.check_instability(rec0)
         self.history = [rec0]
         if rec0.instability:
             self.instability_record = rec0
             return self.history
-
         for i in range(len(temps) - 1):
             T_old = float(temps[i])
             T_new = float(temps[i + 1])
             rec = self.step(T_old, T_new - T_old)
-
-            if rec.terminated_early or ((i + 1) % self.diagnose_every) == 0 or i == len(temps) - 2:
-                payload = self.diagnose_current_state()
-                rec.leading_channel_name = payload.get("channel_name")
-                rec.leading_Q = payload.get("Q")
-                rec.leading_eigenvalue_abs = payload.get("abs_eigenvalue")
-                rec.leading_order_label = payload.get("order_label")
-                rec.diagnosis_payload = payload.get("diagnosis") or {}
-
             rec.instability, rec.instability_reason = self.check_instability(rec)
             self.history.append(rec)
-
-            if rec.terminated_early and rec.termination_reason:
-                print(f"[FRGFlowSolver] {rec.termination_reason}")
-
             if rec.instability:
                 self.instability_record = rec
                 break
-
         return self.history
 
     def history_as_dicts(self) -> List[Dict[str, Any]]:
         return [x.summary_dict() for x in self.history]
 
-    def current_gamma_accessor(self) -> GammaAccessor:
-        return self._fast_gamma
+    def closure_map(self) -> Dict[Tuple[str, str, str, str], Tuple[np.ndarray, np.ndarray]]:
+        return {k: (v[0].copy(), v[1].copy()) for k, v in self._closure_map.items()}
+
+    def transfer_context(self) -> Dict[str, Any]:
+        return {
+            "pp_grid": self.pp_grid,
+            "phd_grid": self.phd_grid,
+            "phc_grid": self.phc_grid,
+            "pp_q_index": {k: v.copy() for k, v in self._pp_q_index.items()},
+            "phd_q_index_plus": {k: v.copy() for k, v in self._phd_q_index_plus.items()},
+            "phc_q_index_plus": {k: v.copy() for k, v in self._phc_q_index_plus.items()},
+            "phc_q_index_minus": {k: v.copy() for k, v in self._phc_q_index_minus.items()},
+        }
 
 
+class SZ0VertexAccessor:
+    def __init__(self, solver: FRGFlowSolverSZ0):
+        self.solver = solver
 
-# ===== Final stage-2 optimized solver =====
-class FRGFlowSolver(FRGFlowSolver):
-    """Final optimized solver.
-
-    Keeps the stage-1 fast vertex evaluator / transfer-index cache, and adds
-    Q-level internal-cache reuse plus vectorized bubble frequency sums.
-    Physics is unchanged relative to the reference solver.
-    """
-
-    def __init__(self, *args, **kwargs):
-        super().__init__(*args, **kwargs)
-        self._precompute_shift_maps()
-
-    def _precompute_shift_maps(self) -> None:
-        spins = self._all_spins_present()
-        self._pp_qminus = {}
-        self._ph_kplus = {}
-        self._phc_kplus = {}
-        self._phc_kminus = {}
-
-        for iq, Q in enumerate(self.pp_grid.q_list):
-            Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._pp_qminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="Q_minus_k")
-
-        for iq, Q in enumerate(self.phd_grid.q_list):
-            Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._ph_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
-
-        for iq, Q in enumerate(self.phc_grid.q_list):
-            Q = np.asarray(Q, dtype=float)
-            for s in spins:
-                self._phc_kplus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_plus_Q")
-                self._phc_kminus[(iq, s)] = shifted_patch_map(self.patchsets, s, Q, mode="k_minus_Q")
-
-    def _build_q_level_internal_caches(self, T: float):
-        cfg = self._flow_config(T)
-        pp_internal_by_iq = {}
-        ph_internal_by_iq = {}
-        for iq, Q in enumerate(self.pp_grid.q_list):
-            shift_cache = {(sa, sb): self._pp_qminus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
-            pp_internal_by_iq[iq] = build_pp_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
-        for iq, Q in enumerate(self.phd_grid.q_list):
-            shift_cache = {(sa, sb): self._ph_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
-            ph_internal_by_iq[iq] = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
-        return cfg, pp_internal_by_iq, ph_internal_by_iq
-
-    def compute_channel_rhs(self, T: float):
-        gamma = self._fast_gamma
-        cfg, pp_internal_by_iq, ph_internal_by_iq = self._build_q_level_internal_caches(T)
-
-        rhs_pp = self._empty_channel_store(self.pp_grid)
-        rhs_phd = self._empty_channel_store(self.phd_grid)
-        rhs_phc = self._empty_channel_store(self.phc_grid)
-
-        for iq, Q in enumerate(self.pp_grid.q_list):
-            internal_cache = pp_internal_by_iq[iq]
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_pp_kernel_fast2(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s2),
-                    outgoing_spins=(s3, s4),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                    internal_cache=internal_cache,
-                    partner_in_resid=self._pp_qminus[(iq, s2)],
-                    partner_out_resid=self._pp_qminus[(iq, s4)],
-                )
-                rhs_pp[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-
-        for iq, Q in enumerate(self.phd_grid.q_list):
-            internal_cache = ph_internal_by_iq[iq]
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_ph_kernel_fast2(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s3),
-                    outgoing_spins=(s4, s2),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                    internal_cache=internal_cache,
-                    partner_in_resid=self._ph_kplus[(iq, s3)],
-                    partner_out_resid=self._ph_kplus[(iq, s2)],
-                )
-                rhs_phd[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-
-        for iq, Q in enumerate(self.phc_grid.q_list):
-            shift_cache = {(sa, sb): self._phc_kplus[(iq, sb)] for sa, sb in available_internal_spin_pairs(self.patchsets)}
-            internal_cache = build_ph_internal_cache_vec(self.patchsets, Q, cfg, shift_cache=shift_cache)
-            for s1, s2, s3, s4 in self.spin_blocks:
-                ker = compute_phc_kernel_fast2(
-                    gamma,
-                    self.patchsets,
-                    Q,
-                    incoming_spins=(s1, s2),
-                    outgoing_spins=(s3, s4),
-                    config=cfg,
-                    allowed_spin_blocks=self.allowed_spin_blocks,
-                    internal_cache=internal_cache,
-                    partner_in_resid=self._phc_kminus[(iq, s4)],
-                    partner_out_resid=self._phc_kplus[(iq, s3)],
-                )
-                rhs_phc[(s1, s2, s3, s4, iq)] = np.asarray(ker.matrix, dtype=complex)
-
-        return rhs_pp, rhs_phd, rhs_phc
-
-    def current_gamma_accessor(self):
-        return self._fast_gamma
+    def __call__(self, p1: int, p2: int, p3: int, p4: int) -> complex:
+        p4_expected = int(self.solver.state.vertex.p4_index[p1, p2, p3])
+        if p4_expected < 0 or int(p4) != p4_expected:
+            return 0.0 + 0.0j
+        return complex(self.solver.state.vertex.data[p1, p2, p3])
 
 
 __all__ = [
-    "BareVertexFromInteraction",
-    "FRGFlowSolver",
-    "FRGState",
+    "BareSZ0VertexFromInteraction",
+    "FRGFlowSolverSZ0",
     "FlowStepRecord",
-    "TransferGrid",
-    "available_physical_spins",
-    "build_unique_q_list",
-    "canonical_spin_tuple",
-    "default_spin_blocks",
-    "_canonicalize_q",
-    "_wrap_reduced_coords_centered",
+    "SZ0FlowState",
+    "SZ0Tensor",
 ]
