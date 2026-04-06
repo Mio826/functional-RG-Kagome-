@@ -88,7 +88,7 @@ class BareSZ0VertexFromInteraction:
     Important
     ---------
     The minimal Sz=0 object is *not* the raw direct density-density matrix
-    element. Bare level consistency with the PRL-compatible convention requires
+    element.  Bare level consistency with the PRL-compatible convention requires
     the antisymmetrized opposite-spin exchanged amplitude.
     """
 
@@ -100,6 +100,8 @@ class BareSZ0VertexFromInteraction:
         if hasattr(self.interaction, "patch_vertex_sz0"):
             return complex(self.interaction.patch_vertex_sz0(self.patchsets, p1, p2, p3, p4))
 
+        # Fallback for older interaction classes: use the *antisymmetrized*
+        # opposite-spin exchanged object, not the raw direct vertex.
         return complex(
             self.interaction.patch_vertex(
                 self.patchsets,
@@ -137,39 +139,22 @@ class FRGFlowSolverSZ0:
         diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
         diagnosis_score_threshold: Optional[float] = None,
         diagnosis_landau_F: bool = False,
-        closure_tol: Optional[float] = None,
-        drop_inexact_closure: bool = False,
     ) -> None:
         self.patchsets = patchsets
         self.bare_vertex = bare_vertex
         self.q_merge_tol_red = float(q_merge_tol_red)
         self.q_key_decimals = int(q_key_decimals)
 
-        self.closure_tol = None if closure_tol is None else float(closure_tol)
-        self.drop_inexact_closure = bool(drop_inexact_closure)
-
         if pp_Qs is None:
-            pp_Qs = build_unique_q_list(
-                patchsets, mode="pp", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-            )
+            pp_Qs = build_unique_q_list(patchsets, mode="pp", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
         if ph_Qs is None:
-            ph_Qs = build_unique_q_list(
-                patchsets, mode="ph", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-            )
+            ph_Qs = build_unique_q_list(patchsets, mode="ph", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
         if phc_Qs is None:
-            phc_Qs = build_unique_q_list(
-                patchsets, mode="phc", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-            )
+            phc_Qs = build_unique_q_list(patchsets, mode="phc", decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
 
-        self.pp_grid = TransferGrid(
-            patchsets, list(pp_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-        )
-        self.phd_grid = TransferGrid(
-            patchsets, list(ph_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-        )
-        self.phc_grid = TransferGrid(
-            patchsets, list(phc_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red
-        )
+        self.pp_grid = TransferGrid(patchsets, list(pp_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
+        self.phd_grid = TransferGrid(patchsets, list(ph_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
+        self.phc_grid = TransferGrid(patchsets, list(phc_Qs), decimals=self.q_key_decimals, merge_tol_red=self.q_merge_tol_red)
 
         self.T_start = float(T_start)
         self.T_stop = float(T_stop)
@@ -240,21 +225,6 @@ class FRGFlowSolverSZ0:
             return np.linspace(self.T_start, self.T_stop, self.n_steps)
         raise ValueError("temperature_grid must be 'log' or 'linear'.")
 
-    def _closure_is_valid(self, p1: int, p2: int, p3: int) -> bool:
-        if not self.drop_inexact_closure:
-            return True
-        if self.closure_tol is None:
-            return True
-        res = float(self.state.vertex.p4_residual[p1, p2, p3])
-        return bool(res <= self.closure_tol)
-
-    def _closure_is_valid_from_arrays(self, p4_residual: np.ndarray, p1: int, p2: int, p3: int) -> bool:
-        if not self.drop_inexact_closure:
-            return True
-        if self.closure_tol is None:
-            return True
-        return bool(float(p4_residual[p1, p2, p3]) <= self.closure_tol)
-
     def _precompute_transfer_tables(self) -> None:
         self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
         self._phd_q_index_plus: Dict[Tuple[str, str], np.ndarray] = {}
@@ -277,6 +247,8 @@ class FRGFlowSolverSZ0:
                         arr_phc_minus[p_src, p_tgt] = self.phc_grid.nearest_index(k_src - k_tgt)
                 self._pp_q_index[(s_src, s_tgt)] = arr_pp
                 self._phd_q_index_plus[(s_src, s_tgt)] = arr_phd_plus
+                # For phc we keep both signs explicitly.  The flow itself uses
+                # Q = k3 - k2, i.e. the "plus" table when indexed as [p2, p3].
                 self._phc_q_index_plus[(s_src, s_tgt)] = arr_phc_plus
                 self._phc_q_index_minus[(s_src, s_tgt)] = arr_phc_minus
 
@@ -331,6 +303,9 @@ class FRGFlowSolverSZ0:
                 "weights": np.asarray(legacy["weights"], dtype=complex),
             }
 
+        # For ph/phc the partner geometry is temperature-independent but the
+        # weights are temperature-dependent.  We store the partner/residual part
+        # here and refresh the weights each step.
         for iq, Q in enumerate(self.phd_grid.q_list):
             partner, residual = self._partner_map_phd_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)
             self._ph_kplus[iq] = {
@@ -386,11 +361,8 @@ class FRGFlowSolverSZ0:
             for p2 in range(self.Npatch):
                 for p3 in range(self.Npatch):
                     p4 = int(p4_idx[p1, p2, p3])
-                    if p4 < 0:
-                        continue
-                    if not self._closure_is_valid_from_arrays(p4_res, p1, p2, p3):
-                        continue
-                    data[p1, p2, p3] = self.bare_vertex(p1, p2, p3, p4)
+                    if p4 >= 0:
+                        data[p1, p2, p3] = self.bare_vertex(p1, p2, p3, p4)
         return SZ0Tensor(data=data, p4_index=p4_idx, p4_residual=p4_res)
 
     def _estimate_bare_vertex_norm(self) -> float:
@@ -406,6 +378,8 @@ class FRGFlowSolverSZ0:
         ph_internal_by_iq: Dict[int, MinimalInternalCache] = {}
         phc_internal_by_iq: Dict[int, MinimalInternalCache] = {}
 
+        # pp: partner geometry and weights are both simplest to refresh through the
+        # legacy helper, then immediately strip the explicit-spin wrapper.
         for iq in range(len(self.pp_grid.q_list)):
             Q = self.pp_grid.q_list[iq]
             legacy = build_pp_internal_cache_vec(
@@ -419,6 +393,7 @@ class FRGFlowSolverSZ0:
                 "weights": np.asarray(legacy["weights"], dtype=complex),
             }
 
+        # ph / phc: refresh only the temperature-dependent weights.
         for iq, template in self._ph_kplus.items():
             legacy = build_ph_internal_cache_vec(
                 self.patchsets,
@@ -451,6 +426,10 @@ class FRGFlowSolverSZ0:
         p4_idx = self.state.vertex.p4_index
         qpp = self._pp_q_index[("up", "dn")]
         qphd = self._phd_q_index_plus[("up", "dn")]
+        # Crossed-ph transfer indices must use the same spin ordering as the
+        # phc internal cache built in _precompute_shift_maps/_refresh_cache_weights.
+        # That cache is constructed for ("up","dn"), so using ("dn","dn") here is
+        # inconsistent and can select the wrong phc transfer sector.
         qphc = self._phc_q_index_plus[("up", "dn")]
 
         v_accessor = self.current_vertex_accessor()
@@ -462,10 +441,13 @@ class FRGFlowSolverSZ0:
                     p4 = int(p4_idx[p1, p2, p3])
                     if p4 < 0:
                         continue
-                    if not self._closure_is_valid(p1, p2, p3):
-                        continue
 
+                    # direct ph transfer: Q = k3 - k1 -> index[p1, p3]
                     phd_cache = ph_internal_by_iq[int(qphd[p1, p3])]
+
+                    # crossed ph transfer: Q = k3 - k2 -> index[p2, p3]
+                    # Keep the q-index lookup consistent with the phc cache spin
+                    # convention chosen above.
                     phc_cache = phc_internal_by_iq[int(qphc[p2, p3])]
 
                     rhs[p1, p2, p3] = (
@@ -480,6 +462,7 @@ class FRGFlowSolverSZ0:
 
     def _apply_rhs(self, rhs: np.ndarray, scale: float) -> None:
         self.state.vertex.data += scale * np.asarray(rhs, dtype=complex)
+
 
     @staticmethod
     def _hermitian_part(matrix: np.ndarray) -> np.ndarray:
@@ -600,6 +583,8 @@ class FRGFlowSolverSZ0:
         return False, None
 
     def step(self, T_old: float, dT: float) -> FlowStepRecord:
+        # First estimate the required substepping from the RHS at the beginning
+        # of the macro step.
         rhs0 = self.compute_vertex_rhs(T_old)
         effective_norm = max(self.state.channel_norm(), self.bare_vertex_norm, 1e-14)
         rhs_norm0 = self._rhs_norm(rhs0)
@@ -630,6 +615,8 @@ class FRGFlowSolverSZ0:
         rhs_norm_max = rhs_norm0
         rel_update_max = rel_update0 / n_sub if n_sub > 0 else rel_update0
 
+        # Refreshed-Euler substepping: recompute RHS after every accepted substep
+        # so that late-stage strong-coupling flow is not integrated with a frozen RHS.
         for _ in range(n_sub):
             rhs_sub = self.compute_vertex_rhs(T_sub)
             rhs_norm_sub = self._rhs_norm(rhs_sub)
@@ -705,8 +692,6 @@ class SZ0VertexAccessor:
     def __call__(self, p1: int, p2: int, p3: int, p4: int) -> complex:
         p4_expected = int(self.solver.state.vertex.p4_index[p1, p2, p3])
         if p4_expected < 0 or int(p4) != p4_expected:
-            return 0.0 + 0.0j
-        if not self.solver._closure_is_valid(p1, p2, p3):
             return 0.0 + 0.0j
         return complex(self.solver.state.vertex.data[p1, p2, p3])
 

@@ -78,12 +78,6 @@ class SZ0ChannelBuilder:
 
     This is a diagnosis-stage filter only. No flow equation is changed.
     Set Landau_F=True to recover the raw ph_charge(Q=0) kernel.
-
-    Closure mask
-    ------------
-    If drop_inexact_closure=True and closure_tol is not None, then any tuple
-    (p1,p2,p3) whose stored p4 residual exceeds closure_tol is treated as
-    invalid and contributes zero to the channel kernels.
     """
 
     def __init__(
@@ -97,8 +91,6 @@ class SZ0ChannelBuilder:
         q_key_decimals: int = 10,
         Landau_F: bool = False,
         q0_tol: float = 1e-10,
-        closure_tol: Optional[float] = None,
-        drop_inexact_closure: bool = False,
     ) -> None:
         self.vertex = build_sz0_vertex_accessor(vertex)
         self.patchsets = patchsets
@@ -117,10 +109,6 @@ class SZ0ChannelBuilder:
         self.q_key_decimals = int(q_key_decimals)
         self.Landau_F = bool(Landau_F)
         self.q0_tol = float(q0_tol)
-
-        self.closure_tol = None if closure_tol is None else float(closure_tol)
-        self.drop_inexact_closure = bool(drop_inexact_closure)
-
         self._load_transfer_context(dict(transfer_context))
 
     def _load_transfer_context(self, ctx: Mapping[str, object]) -> None:
@@ -164,13 +152,6 @@ class SZ0ChannelBuilder:
             raise KeyError(f"Missing closure_map entry for spin block {key}.")
         return float(entry[1][p1, p2, p3])
 
-    def _closure_is_valid(self, p1: int, p2: int, p3: int) -> bool:
-        if not self.drop_inexact_closure:
-            return True
-        if self.closure_tol is None:
-            return True
-        return bool(self._stored_p4_residual(p1, p2, p3) <= self.closure_tol)
-
     def _pp_partner(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
         return partner_map_from_q_index(
             self.patchsets,
@@ -207,16 +188,13 @@ class SZ0ChannelBuilder:
                 p2 = int(partner_in[pin])
                 if p2 >= 0:
                     p4 = self._stored_p4(pin, p2, pout)
-                    residual_here = max(
+                    if int(p4) == p4_partner and int(p4) >= 0:
+                        M[pout, pin] = self.vertex(pin, p2, pout, int(p4))
+                    residuals[pout, pin] = max(
                         float(resid_in[pin]),
                         float(resid_out[pout]),
                         self._stored_p4_residual(pin, p2, pout),
                     )
-                    residuals[pout, pin] = residual_here
-                    if not self._closure_is_valid(pin, p2, pout):
-                        continue
-                    if int(p4) == p4_partner and int(p4) >= 0:
-                        M[pout, pin] = self.vertex(pin, p2, pout, int(p4))
                 else:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return M, partner_in, residuals
@@ -234,8 +212,6 @@ class SZ0ChannelBuilder:
             for pin in range(self.Npatch):
                 p2 = int(partner_in[pin])
                 if p2 >= 0 and p3 >= 0:
-                    if not self._closure_is_valid(pin, p2, p3):
-                        continue
                     p4_expected = self._stored_p4(pin, p2, p3)
                     if int(p4_expected) == int(p4):
                         M[pout, pin] = self.vertex(pin, p2, p3, p4)
@@ -284,17 +260,14 @@ class SZ0ChannelBuilder:
             for pin in range(self.Npatch):
                 p3 = int(kplus_in[pin])
                 if p2 >= 0 and p3 >= 0:
-                    residual_here = max(
+                    p4_expected = self._stored_p4(pin, p2, p3)
+                    if int(p4_expected) == pout:
+                        M[pout, pin] = self.vertex(pin, p2, p3, pout)
+                    residuals[pout, pin] = max(
                         float(resid_in[pin]),
                         float(resid_out[pout]),
                         self._stored_p4_residual(pin, p2, p3),
                     )
-                    residuals[pout, pin] = residual_here
-                    if not self._closure_is_valid(pin, p2, p3):
-                        continue
-                    p4_expected = self._stored_p4(pin, p2, p3)
-                    if int(p4_expected) == pout:
-                        M[pout, pin] = self.vertex(pin, p2, p3, pout)
                 else:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return ChannelKernel(
@@ -322,17 +295,14 @@ class SZ0ChannelBuilder:
             for pin in range(self.Npatch):
                 p4 = int(kplus_in[pin])
                 if p2 >= 0 and p4 >= 0:
-                    residual_here = max(
+                    p4_expected = self._stored_p4(pin, p2, p3)
+                    if int(p4_expected) == int(p4):
+                        M[pout, pin] = self.vertex(pin, p2, p3, p4)
+                    residuals[pout, pin] = max(
                         float(resid_in[pin]),
                         float(resid_out[pout]),
                         self._stored_p4_residual(pin, p2, p3),
                     )
-                    residuals[pout, pin] = residual_here
-                    if not self._closure_is_valid(pin, p2, p3):
-                        continue
-                    p4_expected = self._stored_p4(pin, p2, p3)
-                    if int(p4_expected) == int(p4):
-                        M[pout, pin] = self.vertex(pin, p2, p3, p4)
                 else:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return ChannelKernel(
@@ -395,14 +365,7 @@ class SZ0ChannelBuilder:
         }
 
     @classmethod
-    def from_solver(
-        cls,
-        vertex: SZ0VertexInput,
-        solver: object,
-        *,
-        Landau_F: bool = False,
-        q0_tol: float = 1e-10,
-    ) -> "SZ0ChannelBuilder":
+    def from_solver(cls, vertex: SZ0VertexInput, solver: object, *, Landau_F: bool = False, q0_tol: float = 1e-10) -> "SZ0ChannelBuilder":
         transfer_context = solver.transfer_context() if callable(getattr(solver, "transfer_context", None)) else None
         closure_map = solver.closure_map() if callable(getattr(solver, "closure_map", None)) else getattr(solver, "_closure_map", None)
         return cls(
@@ -412,8 +375,6 @@ class SZ0ChannelBuilder:
             transfer_context=transfer_context,
             Landau_F=Landau_F,
             q0_tol=q0_tol,
-            closure_tol=getattr(solver, "closure_tol", None),
-            drop_inexact_closure=bool(getattr(solver, "drop_inexact_closure", False)),
         )
 
 
