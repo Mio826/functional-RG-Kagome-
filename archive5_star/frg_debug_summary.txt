@@ -1,0 +1,114 @@
+Functional RG debug summary: ph-charge(Q=0) anomaly and current conclusion
+==========================================================================
+
+Project goal
+------------
+Reproduce the PRL phase diagram for the kagome Hubbard model with the current temperature-flow fRG code.
+
+Observed anomaly
+----------------
+For large U, the expected leading instability should be Q=0 ph-spin (FM), but the code instead shows Q=0 ph-charge dominating.
+For large V and other couplings, Q=0 ph-charge also tends to dominate unexpectedly.
+
+What was checked
+----------------
+1. Bare interaction / bare channel decomposition
+   - The initial bare interaction decomposition into the four physical channels looked reasonable.
+   - So the anomaly did not appear to originate from the bare interaction itself.
+
+2. Final channel kernels at Q=0
+   - Visualized pp-singlet, pp-triplet, ph-spin, ph-charge at the final flow step.
+   - ph-charge(Q=0) showed a large nearly uniform background.
+   - ph-spin(Q=0) did not show the same kind of uniform blow-up.
+
+3. Uniform-mode projection on ph-charge(Q=0)
+   - Projected the final ph-charge(Q=0) kernel with
+       K_proj = P_perp K P_perp,
+       P_perp = I - |u><u|,
+       u = (1,1,...,1)/sqrt(N).
+   - After projection, the leading eigenvalue of ph-charge(Q=0) dropped dramatically.
+   - The remaining kernel was not zero: it still contained nontrivial structure.
+   - Therefore the dominant ph-charge result is "uniform piece + structured residue", not purely a fake matrix, but the giant leading scale is strongly tied to the uniform mode.
+
+4. Decomposition into Vd and Vx
+   - The ph direct piece Vd remained structured.
+   - The ph exchange piece Vx developed a large near-uniform background.
+   - Since ph_charge = Vd - 2 Vx, this explains why ph-charge(Q=0) was strongly amplified.
+
+5. Topology-resolved RHS decomposition
+   - Separated the one-loop RHS into pp / phd / phc contributions and projected them to Q=0 kernels.
+   - The large near-uniform background in Vx(Q=0) was traced mainly to the phc contribution.
+   - pp and phd contributions to Vx(Q=0) were much smaller / less relevant.
+
+6. Internal-patch decomposition inside phc
+   - Decomposed phc by internal patch a.
+   - A single internal patch did not produce a constant matrix.
+   - Instead, each single-a contribution had a structured "cross-like" pattern.
+   - Summing many such contributions gradually washed the structure out and produced the near-uniform background.
+
+7. Weight / velocity-factor tests
+   - Tried modifying phc internal weights by factors such as 1/vF and 1/sqrt(vF).
+   - This did not remove the structural issue in a controlled way.
+   - Instead, it strongly changed the overall normalization and blew up all channels.
+   - Conclusion: a missing explicit 1/vF factor is not the main cause of the anomaly.
+
+8. q-index / transfer-sector checks
+   - The phc q-index table itself did not collapse globally: many distinct iq sectors existed and had nonzero cache weights.
+   - So the issue is not simply that the phc bubble exists only at iq=0.
+   - The more relevant statement is that in the external Q=0 sector, the phc contraction and the final projection to Vx combine to generate a strong uniform row-sum-like mode.
+
+9. External-pair decomposition in the Q=0 sector
+   - Decomposed the phc contribution by external (p2, p3) pairs satisfying Q=0.
+   - Each single external pair contributed essentially a row-like mode (one horizontal stripe).
+   - Summing many such row-modes across the whole Q=0 sector produced the near-uniform Vx background.
+   - This is the clearest structural explanation of the observed ph-charge(Q=0) blow-up.
+
+Current conclusion
+------------------
+The current evidence suggests that the giant leading ph-charge(Q=0) scale is dominated by a trivial L=0 forward-scattering / Landau-like charge mode, not by the nontrivial charge instability of physical interest (such as a d-wave PI).
+
+In practical terms:
+- The problematic structure is concentrated in ph-charge at Q=0.
+- It is generated mainly through the phc contribution to Vx.
+- It is built from the accumulation of many row-like contributions in the external Q=0 sector.
+- This mode should not be interpreted as the physically relevant instability to compare against the PRL phase diagram.
+
+Recommended diagnosis rule
+--------------------------
+Do NOT modify the flow equation yet.
+Do the following only at the final diagnosis stage:
+
+1. For ph-charge at Q=0, remove the uniform L=0 mode by projection:
+       u = (1,1,...,1)/sqrt(N),
+       P_perp = I - |u><u|,
+       K_proj = P_perp K P_perp.
+
+2. Then compare:
+   - ph_charge_proj(Q=0)
+   - ph_spin(Q=0)
+   - finite-Q channels (especially M-point channels)
+   - pp channels
+
+Important caution
+-----------------
+- Apply this projection only to ph-charge(Q=0).
+- Do NOT apply the same removal to ph-spin(Q=0), because the uniform spin mode is precisely the FM mode that should remain.
+- Do NOT subtract a naive constant number from every matrix element. The safe operation is projection with P_perp, not crude mean subtraction.
+
+Interpretation for PI
+---------------------
+This diagnosis-stage projection should remove only the L=0 uniform charge mode.
+A genuine PI (for example, d-wave / L=2) should remain in the subspace orthogonal to the uniform vector, so in principle it should still be visible after the projection.
+
+Open point
+----------
+This does not yet prove that the full flow implementation is mathematically identical to the PRL implementation in every detail.
+What it does show is:
+- the present dominant ph-charge(Q=0) signal is heavily contaminated by a trivial uniform mode,
+- and this contamination is the main reason the raw diagnosis disagrees with the PRL-style physical interpretation.
+
+Most likely next step
+---------------------
+Use the projected ph-charge(Q=0) kernel in the final diagnosis and re-check whether:
+- large U gives Q=0 ph-spin (FM),
+- large V gives finite-Q charge/bond order or nontrivial Q=0 PI structure.

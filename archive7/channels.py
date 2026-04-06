@@ -23,6 +23,8 @@ SpinLike = Union[str, int]
 class ChannelKernel:
     """Patch-space kernel for one physical channel at fixed Q."""
     name: str
+    channel_type: str
+    spin_structure: str
     Q: np.ndarray
     matrix: np.ndarray
     row_patches: np.ndarray
@@ -30,6 +32,16 @@ class ChannelKernel:
     row_partner_patches: np.ndarray
     col_partner_patches: np.ndarray
     residuals: np.ndarray
+
+    def summary_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "channel_type": self.channel_type,
+            "spin_structure": self.spin_structure,
+            "Q": np.asarray(self.Q, dtype=float).tolist(),
+            "Npatch": self.Npatch,
+            "hermitian_residual": self.hermitian_residual(),
+        }
 
     @property
     def Npatch(self) -> int:
@@ -223,6 +235,8 @@ class SZ0ChannelBuilder:
         Vex = self._pp_out_exchange_v(Q)
         return ChannelKernel(
             name="pp_singlet",
+            channel_type="pp",
+            spin_structure="singlet",
             Q=np.asarray(Q, dtype=float),
             matrix=Vraw + Vex,
             row_patches=np.arange(self.Npatch, dtype=int),
@@ -238,6 +252,8 @@ class SZ0ChannelBuilder:
         Vex = self._pp_out_exchange_v(Q)
         return ChannelKernel(
             name="pp_triplet",
+            channel_type="pp",
+            spin_structure="triplet",
             Q=np.asarray(Q, dtype=float),
             matrix=Vraw - Vex,
             row_patches=np.arange(self.Npatch, dtype=int),
@@ -272,6 +288,8 @@ class SZ0ChannelBuilder:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return ChannelKernel(
             name="ph_direct",
+            channel_type="ph",
+            spin_structure="direct",
             Q=np.asarray(Q, dtype=float),
             matrix=M,
             row_patches=np.arange(self.Npatch, dtype=int),
@@ -307,6 +325,8 @@ class SZ0ChannelBuilder:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
         return ChannelKernel(
             name="ph_exchange",
+            channel_type="ph",
+            spin_structure="exchange",
             Q=np.asarray(Q, dtype=float),
             matrix=M,
             row_patches=np.arange(self.Npatch, dtype=int),
@@ -332,6 +352,8 @@ class SZ0ChannelBuilder:
 
         return ChannelKernel(
             name=name,
+            channel_type="ph",
+            spin_structure="charge",
             Q=np.asarray(Q, dtype=float),
             matrix=matrix,
             row_patches=Vd.row_patches.copy(),
@@ -346,6 +368,8 @@ class SZ0ChannelBuilder:
         Vd = self.ph_direct(Q)
         return ChannelKernel(
             name="ph_spin",
+            channel_type="ph",
+            spin_structure="spin",
             Q=np.asarray(Q, dtype=float),
             matrix=Vd.matrix.copy(),
             row_patches=Vd.row_patches.copy(),

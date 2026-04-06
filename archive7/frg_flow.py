@@ -23,6 +23,9 @@ from frg_kernel import (
     patchset_for_spin,
 )
 
+from channels import SZ0ChannelBuilder
+from instability import InstabilityConfig, InstabilityResult, diagnose_kernel_collection
+
 
 @dataclass
 class SZ0Tensor:
@@ -137,8 +140,10 @@ class FRGFlowSolverSZ0:
         q_merge_tol_red: float = 5e-2,
         q_key_decimals: int = 10,
         diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
-        diagnosis_score_threshold: Optional[float] = None,
-        diagnosis_landau_F: bool = False,
+        diagnosis_Landau_F: bool = False,
+        instability_config: Optional[InstabilityConfig] = None,
+        instability_stop_enabled: bool = False,
+        instability_score_threshold: Optional[float] = None,
     ) -> None:
         self.patchsets = patchsets
         self.bare_vertex = bare_vertex
@@ -168,11 +173,10 @@ class FRGFlowSolverSZ0:
         self.min_substep_fraction = float(min_substep_fraction)
         self.channel_divergence_threshold = float(channel_divergence_threshold)
         self.diagnose_every = int(diagnose_every)
-        self.diagnosis_Qs = None if diagnosis_Qs is None else [
-            np.asarray(canonicalize_q_for_patchsets(patchsets, q), dtype=float) for q in diagnosis_Qs
-        ]
-        self.diagnosis_score_threshold = None if diagnosis_score_threshold is None else float(diagnosis_score_threshold)
-        self.diagnosis_landau_F = bool(diagnosis_landau_F)
+        self.diagnosis_Landau_F = bool(diagnosis_Landau_F)
+        self.instability_config = instability_config if instability_config is not None else InstabilityConfig()
+        self.instability_stop_enabled = bool(instability_stop_enabled)
+        self.instability_score_threshold = instability_score_threshold
 
         self._spins = ("up", "dn")
         self._validate_patch_counts()
@@ -201,6 +205,9 @@ class FRGFlowSolverSZ0:
         self._fast_vertex = SZ0VertexAccessor(self)
         self.bare_vertex_norm = self._estimate_bare_vertex_norm()
         self.temperature_path = self._build_temperature_path()
+        if diagnosis_Qs is None:
+            diagnosis_Qs = [np.zeros(2, dtype=float)]
+        self.diagnosis_Qs = [canonicalize_q_for_patchsets(self.patchsets, Q) for Q in diagnosis_Qs]
         self.history: List[FlowStepRecord] = []
         self.instability_record: Optional[FlowStepRecord] = None
 
@@ -463,179 +470,90 @@ class FRGFlowSolverSZ0:
     def _apply_rhs(self, rhs: np.ndarray, scale: float) -> None:
         self.state.vertex.data += scale * np.asarray(rhs, dtype=complex)
 
-
-    @staticmethod
-    def _hermitian_part(matrix: np.ndarray) -> np.ndarray:
-        M = np.asarray(matrix, dtype=complex)
-        return 0.5 * (M + M.conjugate().T)
-
-    @staticmethod
-    def _sign_aware_channel_score(channel_name: str, matrix: np.ndarray) -> Dict[str, Any]:
-        H = FRGFlowSolverSZ0._hermitian_part(matrix)
-        evals, _ = np.linalg.eigh(H)
-        eval_pos_max = float(np.max(evals)) if evals.size else 0.0
-        eval_neg_min = float(np.min(evals)) if evals.size else 0.0
-
-        if channel_name.startswith("pp"):
-            physical_score = max(eval_pos_max, 0.0)
-            chosen_eval = eval_pos_max
-            chosen_sign = "positive"
-        elif channel_name.startswith("ph"):
-            physical_score = max(-eval_neg_min, 0.0)
-            chosen_eval = eval_neg_min
-            chosen_sign = "negative"
-        else:
-            raise ValueError(f"Unknown channel name: {channel_name}")
-
-        return {
-            "eval_pos_max": eval_pos_max,
-            "eval_neg_min": eval_neg_min,
-            "physical_score": float(physical_score),
-            "chosen_eval": float(chosen_eval),
-            "chosen_sign": chosen_sign,
-            "herm_resid": float(np.max(np.abs(np.asarray(matrix) - np.asarray(matrix).conjugate().T))),
-        }
-
-    def _build_channel_builder(self):
-        from channels import SZ0ChannelBuilder
-        return SZ0ChannelBuilder.from_solver(
-            self.current_vertex_accessor(),
-            self,
-            Landau_F=self.diagnosis_landau_F,
-        )
-
-    def _diagnose_sign_aware_channels(self) -> Dict[str, Any]:
-        if not self.diagnosis_Qs:
-            return {}
-
-        builder = self._build_channel_builder()
-        rows: List[Dict[str, Any]] = []
-        q_payload: List[Dict[str, Any]] = []
-
-        for iq, Q in enumerate(self.diagnosis_Qs):
-            kernel_dict = builder.build_kernel_dict(Q, Landau_F=self.diagnosis_landau_F)
-            q_entry: Dict[str, Any] = {
-                "Q_index": int(iq),
-                "Q": np.asarray(Q, dtype=float),
-                "channels": {},
-            }
-            for ch_name, ker in kernel_dict.items():
-                info = self._sign_aware_channel_score(ch_name, ker.matrix)
-                row = {
-                    "channel": ch_name,
-                    "Q_index": int(iq),
-                    "Q": np.asarray(Q, dtype=float),
-                    **info,
-                }
-                rows.append(row)
-                q_entry["channels"][ch_name] = row
-            q_payload.append(q_entry)
-
-        if not rows:
-            return {}
-
-        best = max(rows, key=lambda x: x["physical_score"])
-        return {
-            "diagnosis_mode": "sign_aware_hermitian_channel_score",
-            "Landau_F": bool(self.diagnosis_landau_F),
-            "Qs": [np.asarray(q, dtype=float) for q in self.diagnosis_Qs],
-            "rows": rows,
-            "per_Q": q_payload,
-            "leading_channel": str(best["channel"]),
-            "leading_Q_index": int(best["Q_index"]),
-            "leading_Q": np.asarray(best["Q"], dtype=float),
-            "leading_score": float(best["physical_score"]),
-            "leading_chosen_eval": float(best["chosen_eval"]),
-            "leading_chosen_sign": str(best["chosen_sign"]),
-        }
-
     def diagnose_current_state(self) -> Dict[str, Any]:
         payload: Dict[str, Any] = {
             "representation": "sz0_minimal",
             "stored_object": "V(p1,p2,p3; p4 via closure)",
             "channel_norm": self.state.channel_norm(),
+            "diagnosis_Qs": [np.asarray(Q, dtype=float).tolist() for Q in self.diagnosis_Qs],
         }
-        if self.diagnosis_Qs:
-            try:
-                payload["sign_aware"] = self._diagnose_sign_aware_channels()
-            except Exception as exc:
-                payload["sign_aware_error"] = repr(exc)
+        try:
+            builder = SZ0ChannelBuilder.from_solver(
+                self.current_vertex_accessor(),
+                self,
+                Landau_F=self.diagnosis_Landau_F,
+            )
+            results: List[InstabilityResult] = []
+            flow_cfg = self._flow_config(self.state.T)
+            for Q in self.diagnosis_Qs:
+                kernel_dict = builder.build_kernel_dict(Q, Landau_F=self.diagnosis_Landau_F)
+                diagnosed = diagnose_kernel_collection(
+                    kernel_dict,
+                    self.patchsets,
+                    self.transfer_context(),
+                    flow_cfg,
+                    config=self.instability_config,
+                )
+                results.extend(diagnosed.values())
+            result_summaries = [r.summary_dict() for r in results]
+            payload["instability_results"] = result_summaries
+            if result_summaries:
+                lead = max(result_summaries, key=lambda x: float(x["score"]))
+                payload["leading_instability"] = dict(lead)
+        except Exception as exc:
+            payload["instability_results_error"] = f"{type(exc).__name__}: {exc}"
         return payload
 
     def check_instability(self, record: FlowStepRecord) -> Tuple[bool, Optional[str]]:
         if record.terminated_early:
             return True, record.termination_reason or "flow terminated early"
-
-        if self.diagnosis_score_threshold is not None:
-            sign_aware = record.diagnosis_payload.get("sign_aware", {}) if isinstance(record.diagnosis_payload, dict) else {}
-            leading_score = sign_aware.get("leading_score") if isinstance(sign_aware, dict) else None
-            if leading_score is not None and float(leading_score) >= float(self.diagnosis_score_threshold):
-                leading_channel = sign_aware.get("leading_channel", "unknown")
-                leading_q = sign_aware.get("leading_Q", None)
-                q_str = np.array2string(np.asarray(leading_q, dtype=float), precision=6) if leading_q is not None else "unknown"
-                return True, (
-                    f"sign-aware diagnosis score={float(leading_score):.3e} exceeded diagnosis_score_threshold "
-                    f"for channel={leading_channel} at Q={q_str}"
-                )
-
         if record.channel_norm >= self.channel_divergence_threshold:
             return True, f"channel norm={record.channel_norm:.3e} exceeded channel_divergence_threshold"
+        if self.instability_stop_enabled and self.instability_score_threshold is not None:
+            lead = record.diagnosis_payload.get("leading_instability")
+            if isinstance(lead, Mapping):
+                score = lead.get("score")
+                if score is not None and float(score) >= float(self.instability_score_threshold):
+                    return True, f"instability score={float(score):.3e} exceeded instability_score_threshold"
         return False, None
 
     def step(self, T_old: float, dT: float) -> FlowStepRecord:
-        # First estimate the required substepping from the RHS at the beginning
-        # of the macro step.
-        rhs0 = self.compute_vertex_rhs(T_old)
+        rhs = self.compute_vertex_rhs(T_old)
         effective_norm = max(self.state.channel_norm(), self.bare_vertex_norm, 1e-14)
-        rhs_norm0 = self._rhs_norm(rhs0)
-        rel_update0 = abs(dT) * rhs_norm0 / effective_norm
-        n_sub = max(1, int(np.ceil(rel_update0 / self.max_relative_update))) if rel_update0 > self.max_relative_update else 1
+        rhs_norm = self._rhs_norm(rhs)
+        rel_update = abs(dT) * rhs_norm / effective_norm
+        n_sub = max(1, int(np.ceil(rel_update / self.max_relative_update))) if rel_update > self.max_relative_update else 1
         if (1.0 / n_sub) < self.min_substep_fraction:
             attempted_T_new = float(T_old + dT)
             message = (
                 "Adaptive step control requested too many substeps; stopping flow early. "
                 f"Current state remains at T={float(T_old):.8f}, attempted T_new={attempted_T_new:.8f}, "
-                f"rhs_norm={rhs_norm0:.3e}, rel_update={rel_update0:.3e}, proposed_n_sub={n_sub}."
+                f"rhs_norm={rhs_norm:.3e}, rel_update={rel_update:.3e}, proposed_n_sub={n_sub}."
             )
             return FlowStepRecord(
                 step_index=len(self.history),
                 temperature=float(T_old),
                 dT=float(dT),
                 channel_norm=self.state.channel_norm(),
-                rhs_norm=rhs_norm0,
+                rhs_norm=rhs_norm,
                 accepted_substeps=0,
-                max_rel_update=rel_update0,
+                max_rel_update=rel_update,
                 terminated_early=True,
                 termination_reason=message,
                 diagnosis_payload=self.diagnose_current_state(),
             )
-
         sub_dT = dT / n_sub
-        T_sub = float(T_old)
-        rhs_norm_max = rhs_norm0
-        rel_update_max = rel_update0 / n_sub if n_sub > 0 else rel_update0
-
-        # Refreshed-Euler substepping: recompute RHS after every accepted substep
-        # so that late-stage strong-coupling flow is not integrated with a frozen RHS.
         for _ in range(n_sub):
-            rhs_sub = self.compute_vertex_rhs(T_sub)
-            rhs_norm_sub = self._rhs_norm(rhs_sub)
-            effective_norm_sub = max(self.state.channel_norm(), self.bare_vertex_norm, 1e-14)
-            rel_update_sub = abs(sub_dT) * rhs_norm_sub / effective_norm_sub
-            rhs_norm_max = max(rhs_norm_max, rhs_norm_sub)
-            rel_update_max = max(rel_update_max, rel_update_sub)
-            self._apply_rhs(rhs_sub, sub_dT)
-            T_sub = float(T_sub + sub_dT)
-            self.state.T = T_sub
-
+            self._apply_rhs(rhs, sub_dT)
+        self.state.T = float(T_old + dT)
         return FlowStepRecord(
             step_index=len(self.history),
             temperature=float(T_old + dT),
             dT=float(dT),
             channel_norm=self.state.channel_norm(),
-            rhs_norm=rhs_norm_max,
+            rhs_norm=rhs_norm,
             accepted_substeps=n_sub,
-            max_rel_update=rel_update_max,
+            max_rel_update=rel_update / n_sub if n_sub > 0 else rel_update,
             diagnosis_payload=self.diagnose_current_state(),
         )
 
