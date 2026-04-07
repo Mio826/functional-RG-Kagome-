@@ -14,7 +14,6 @@ from frg_kernel import (
     build_pp_internal_cache_vec,
     canonicalize_q_for_patchsets,
     partner_map_from_q_index,
-    patch_measure_vector,
     patchset_for_spin,
 )
 
@@ -47,10 +46,10 @@ class InstabilityConfig:
     - ``pp_sign`` defaults to ``+1`` in the repaired pp diagnosis, together with
       ``abs`` bubble weights, to avoid re-promoting the local repulsive
       Q=0 pp-singlet mode as a fake pairing instability.
-    - ``ph_bubble_mode='patchrep'`` is the default. It computes a patch-resolved
-      ph bubble using the partner map and patch energies.
-    - The patch-measure fields must match the flow setup whenever you want the
-      instability diagnosis to analyze the same discretized problem as the flow.
+    - ``ph_bubble_mode='patchrep'`` is the new default. It computes a genuine
+      patch-resolved ph bubble using the partner map and patch energies, instead
+      of reusing the flow's internal-cache weights, which were effectively only
+      a support mask with constant active-patch weight.
     """
 
     ph_sign: int = -1
@@ -65,11 +64,6 @@ class InstabilityConfig:
     store_operator_matrices: bool = True
     store_all_evals: bool = False
     projection_tol: float = 1e-12
-
-    # Must be synchronized with the flow if flow uses non-unit patch measure.
-    patch_measure_mode: str = "unit"
-    patch_measure_soft_vf_eps: Optional[float] = None
-    patch_measure_normalize_mean: bool = False
 
 
 @dataclass
@@ -183,38 +177,6 @@ def _patch_energies(ps) -> np.ndarray:
     return np.array([float(p.energy) for p in ps.patches], dtype=float)
 
 
-def _resolve_measure_config(
-    transfer_context: Mapping[str, Any],
-    config: InstabilityConfig,
-) -> Tuple[str, Optional[float], bool, Tuple[str, ...]]:
-    notes = []
-    mode = str(config.patch_measure_mode)
-    eps = config.patch_measure_soft_vf_eps
-    norm = bool(config.patch_measure_normalize_mean)
-
-    ctx_mode = transfer_context.get("patch_measure_mode", None)
-    ctx_eps = transfer_context.get("patch_measure_soft_vf_eps", None)
-    ctx_norm = transfer_context.get("patch_measure_normalize_mean", None)
-
-    if ctx_mode is not None:
-        if str(ctx_mode) != mode:
-            notes.append(
-                f"measure_mode_override: config={mode}, context={ctx_mode}; using config"
-            )
-    if ctx_eps is not None and eps is not None:
-        if float(ctx_eps) != float(eps):
-            notes.append(
-                f"measure_soft_vf_eps_override: config={eps}, context={ctx_eps}; using config"
-            )
-    if ctx_norm is not None:
-        if bool(ctx_norm) != norm:
-            notes.append(
-                f"measure_normalize_override: config={norm}, context={bool(ctx_norm)}; using config"
-            )
-
-    return mode, eps, norm, tuple(notes)
-
-
 def _ph_shift_from_context(
     patchsets: PatchSetMap,
     transfer_context: Mapping[str, Any],
@@ -281,9 +243,6 @@ def build_ph_bubble_weights_internal_cache(
     flow_config: FlowConfig,
     *,
     bubble_floor: float = 0.0,
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
     """Legacy ph bubble path: directly reuse flow internal-cache weights."""
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
@@ -292,15 +251,8 @@ def build_ph_bubble_weights_internal_cache(
         patchsets,
         flow_config,
         shift_cache={("up", "dn"): (np.asarray(partner, dtype=int), np.asarray(residual, dtype=float))},
-        patch_measure_mode=patch_measure_mode,
-        patch_measure_soft_vf_eps=patch_measure_soft_vf_eps,
-        patch_measure_normalize_mean=patch_measure_normalize_mean,
     )[("up", "dn")]
     weights, notes = _sanitize_bubble_weights(np.asarray(legacy["weights"], dtype=complex), floor=bubble_floor)
-    notes = tuple(list(notes) + [
-        f"patch_measure_mode={patch_measure_mode}",
-        f"patch_measure_normalize_mean={bool(patch_measure_normalize_mean)}",
-    ])
     return BubbleWeights(
         channel_type="ph",
         Q=np.asarray(Q, dtype=float),
@@ -320,23 +272,21 @@ def build_ph_bubble_weights_patchrep(
     flow_config: FlowConfig,
     *,
     bubble_floor: float = 0.0,
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
-    """Patch-representative ph bubble with synchronized patch measure."""
+    """Patch-representative ph bubble.
+
+    For each patch representative p we explicitly evaluate
+        chi0(Q,p) ~ bubble_dot_ph(eps_p, eps_{p+Q})
+    using the same partner map / Q semantics as the flow, but *not* reusing the
+    flow's coarse internal-cache weight tensor. This preserves patch-resolved
+    energy dependence and avoids collapsing ph diagnosis into a support mask.
+    """
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
     partner, residual = _ph_shift_from_context(patchsets, transfer_context, Q)
     ps_src = patchset_for_spin(patchsets, "up")
     ps_tgt = patchset_for_spin(patchsets, "dn")
     eps_src = _patch_energies(ps_src)
     eps_tgt = _patch_energies(ps_tgt)
-    measure_src = patch_measure_vector(
-        ps_src,
-        mode=patch_measure_mode,
-        soft_vf_eps=patch_measure_soft_vf_eps,
-        normalize_mean=patch_measure_normalize_mean,
-    )
 
     weights = np.zeros(ps_src.Npatch, dtype=complex)
     valid = np.asarray(partner, dtype=int) >= 0
@@ -345,14 +295,10 @@ def build_ph_bubble_weights_patchrep(
             bubble_dot_ph(float(eps_src[i]), float(eps_tgt[int(partner[i])]), flow_config)
             for i in np.flatnonzero(valid)
         ]
-        weights[np.flatnonzero(valid)] = np.asarray(measure_src[np.flatnonzero(valid)], dtype=float) * np.asarray(vals, dtype=complex)
+        weights[np.flatnonzero(valid)] = np.asarray(vals, dtype=complex)
 
     weights, notes = _sanitize_bubble_weights(weights, floor=bubble_floor)
-    notes = tuple(list(notes) + [
-        "ph_bubble_mode=patchrep",
-        f"patch_measure_mode={patch_measure_mode}",
-        f"patch_measure_normalize_mean={bool(patch_measure_normalize_mean)}",
-    ])
+    notes = tuple(list(notes) + ["ph_bubble_mode=patchrep"])
     return BubbleWeights(
         channel_type="ph",
         Q=np.asarray(Q, dtype=float),
@@ -360,7 +306,7 @@ def build_ph_bubble_weights_patchrep(
         partner_patches=np.asarray(partner, dtype=int),
         residuals=np.asarray(residual, dtype=float),
         temperature=float(flow_config.temperature),
-        source="patchrep:bubble_dot_ph(eps_p,eps_p+Q)*measure_p",
+        source="patchrep:bubble_dot_ph(eps_p,eps_p+Q)",
         notes=notes,
     )
 
@@ -373,9 +319,6 @@ def build_ph_bubble_weights(
     *,
     bubble_floor: float = 0.0,
     mode: str = "patchrep",
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
     if mode == "patchrep":
         return build_ph_bubble_weights_patchrep(
@@ -384,9 +327,6 @@ def build_ph_bubble_weights(
             transfer_context,
             flow_config,
             bubble_floor=bubble_floor,
-            patch_measure_mode=patch_measure_mode,
-            patch_measure_soft_vf_eps=patch_measure_soft_vf_eps,
-            patch_measure_normalize_mean=patch_measure_normalize_mean,
         )
     if mode == "internal_cache":
         return build_ph_bubble_weights_internal_cache(
@@ -395,9 +335,6 @@ def build_ph_bubble_weights(
             transfer_context,
             flow_config,
             bubble_floor=bubble_floor,
-            patch_measure_mode=patch_measure_mode,
-            patch_measure_soft_vf_eps=patch_measure_soft_vf_eps,
-            patch_measure_normalize_mean=patch_measure_normalize_mean,
         )
     raise ValueError("ph bubble mode must be 'patchrep' or 'internal_cache'.")
 
@@ -409,26 +346,20 @@ def build_pp_bubble_weights(
     flow_config: FlowConfig,
     *,
     bubble_floor: Optional[float] = None,
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
-    """Build patch-diagonal pp bubble weights using the same helper as the flow."""
+    """Build patch-diagonal pp bubble weights using the same helper as the flow.
+
+    For pp we intentionally keep the raw sign information and do *not* default to
+    clipping negative values. The repaired pp operator uses abs(weights) later.
+    """
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
     partner, residual = _pp_shift_from_context(patchsets, transfer_context, Q)
     legacy = build_pp_internal_cache_vec(
         patchsets,
         flow_config,
         shift_cache={("up", "dn"): (np.asarray(partner, dtype=int), np.asarray(residual, dtype=float))},
-        patch_measure_mode=patch_measure_mode,
-        patch_measure_soft_vf_eps=patch_measure_soft_vf_eps,
-        patch_measure_normalize_mean=patch_measure_normalize_mean,
     )[("up", "dn")]
     weights, notes = _sanitize_bubble_weights(np.asarray(legacy["weights"], dtype=complex), floor=bubble_floor)
-    notes = tuple(list(notes) + [
-        f"patch_measure_mode={patch_measure_mode}",
-        f"patch_measure_normalize_mean={bool(patch_measure_normalize_mean)}",
-    ])
     return BubbleWeights(
         channel_type="pp",
         Q=np.asarray(Q, dtype=float),
@@ -587,9 +518,7 @@ def diagnose_channel_instability(
     channel_type = infer_channel_type(channel_kernel)
     spin_structure = infer_spin_structure(channel_kernel)
 
-    measure_mode, measure_eps, measure_norm, measure_notes = _resolve_measure_config(transfer_context, config)
-
-    notes = list(measure_notes)
+    notes = []
     if channel_type == "ph":
         bubble = build_ph_bubble_weights(
             channel_kernel,
@@ -598,9 +527,6 @@ def diagnose_channel_instability(
             flow_config,
             bubble_floor=config.bubble_floor,
             mode=config.ph_bubble_mode,
-            patch_measure_mode=measure_mode,
-            patch_measure_soft_vf_eps=measure_eps,
-            patch_measure_normalize_mean=measure_norm,
         )
         sign_used: Optional[int] = int(config.ph_sign)
     elif channel_type == "pp":
@@ -610,9 +536,6 @@ def diagnose_channel_instability(
             transfer_context,
             flow_config,
             bubble_floor=None,
-            patch_measure_mode=measure_mode,
-            patch_measure_soft_vf_eps=measure_eps,
-            patch_measure_normalize_mean=measure_norm,
         )
         sign_used = None if config.pp_sign is None else int(config.pp_sign)
         notes.append("pp_operator_uses_abs_bubble_weights")

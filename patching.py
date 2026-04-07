@@ -1,6 +1,14 @@
+from __future__ import annotations
+
+from dataclasses import dataclass, field, replace
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
-from dataclasses import dataclass, replace
-from typing import Optional, List, Tuple
+
+
+# =============================================================================
+# Standard patch data structures
+# =============================================================================
 
 
 @dataclass
@@ -14,6 +22,13 @@ class PatchPoint:
     eigvec: np.ndarray
     orbital_weight: np.ndarray
 
+    tangent: Optional[np.ndarray] = None
+    normal: Optional[np.ndarray] = None
+
+    fs_arc_length: Optional[float] = None
+    weight_length: Optional[float] = None
+    weight_length_over_vf: Optional[float] = None
+
 
 @dataclass
 class PatchSet:
@@ -22,12 +37,17 @@ class PatchSet:
     band_index: int
     filling: float
     patches: List[PatchPoint]
+
     fs_contour_k: np.ndarray
     bz_vertices: np.ndarray
     b1: np.ndarray
     b2: np.ndarray
+
     gauge_method: Optional[str] = None
     gauge_loop_phase: float = 0.0
+    name: Optional[str] = None
+    model_name: Optional[str] = None
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
     @property
     def Npatch(self) -> int:
@@ -35,19 +55,55 @@ class PatchSet:
 
     @property
     def patch_k(self) -> np.ndarray:
-        return np.array([p.k_cart for p in self.patches])
+        return np.array([p.k_cart for p in self.patches], dtype=float)
+
+    @property
+    def patch_k_red(self) -> np.ndarray:
+        return np.array([p.k_red for p in self.patches], dtype=float)
+
+    @property
+    def patch_energy(self) -> np.ndarray:
+        return np.array([p.energy for p in self.patches], dtype=float)
 
     @property
     def patch_vF(self) -> np.ndarray:
-        return np.array([p.vF for p in self.patches])
+        return np.array([p.vF for p in self.patches], dtype=float)
+
+    @property
+    def patch_vF_norm(self) -> np.ndarray:
+        return np.array([p.vF_norm for p in self.patches], dtype=float)
 
     @property
     def patch_weight(self) -> np.ndarray:
-        return np.array([p.orbital_weight for p in self.patches])
+        return np.array([p.orbital_weight for p in self.patches], dtype=float)
 
     @property
     def patch_eigvec(self) -> np.ndarray:
-        return np.array([p.eigvec for p in self.patches])
+        return np.array([p.eigvec for p in self.patches], dtype=complex)
+
+    @property
+    def patch_arc_length(self) -> np.ndarray:
+        return np.array(
+            [0.0 if p.fs_arc_length is None else p.fs_arc_length for p in self.patches],
+            dtype=float,
+        )
+
+    @property
+    def patch_weight_length(self) -> np.ndarray:
+        return np.array(
+            [0.0 if p.weight_length is None else p.weight_length for p in self.patches],
+            dtype=float,
+        )
+
+    @property
+    def patch_weight_length_over_vf(self) -> np.ndarray:
+        return np.array(
+            [
+                0.0 if p.weight_length_over_vf is None else p.weight_length_over_vf
+                for p in self.patches
+            ],
+            dtype=float,
+        )
 
     def copy_with_eigvecs(
         self,
@@ -57,23 +113,19 @@ class PatchSet:
         gauge_loop_phase: Optional[float] = None,
     ) -> "PatchSet":
         eigvecs = np.asarray(eigvecs, dtype=complex)
-        if eigvecs.shape != (self.Npatch, self.patch_eigvec.shape[1]):
+        if eigvecs.shape != self.patch_eigvec.shape:
             raise ValueError(
-                f"eigvecs must have shape {(self.Npatch, self.patch_eigvec.shape[1])}, got {eigvecs.shape}"
+                f"eigvecs must have shape {self.patch_eigvec.shape}, got {eigvecs.shape}"
             )
 
-        new_patches = []
+        new_patches: List[PatchPoint] = []
         for p, u in zip(self.patches, eigvecs):
-            uu = np.asarray(u, dtype=complex)
-            nrm = np.linalg.norm(uu)
-            if nrm == 0:
-                raise ValueError("Encountered zero-norm eigvec in copy_with_eigvecs.")
-            uu = uu / nrm
+            uu = _normalize_eigvec(u)
             new_patches.append(
                 replace(
                     p,
                     eigvec=uu,
-                    orbital_weight=np.abs(uu) ** 2 / np.sum(np.abs(uu) ** 2),
+                    orbital_weight=_orbital_weight(uu),
                 )
             )
 
@@ -88,750 +140,784 @@ class PatchSet:
             b1=self.b1.copy(),
             b2=self.b2.copy(),
             gauge_method=self.gauge_method if gauge_method is None else gauge_method,
-            gauge_loop_phase=self.gauge_loop_phase if gauge_loop_phase is None else gauge_loop_phase,
+            gauge_loop_phase=(
+                self.gauge_loop_phase if gauge_loop_phase is None else gauge_loop_phase
+            ),
+            name=self.name,
+            model_name=self.model_name,
+            metadata=dict(self.metadata),
         )
 
 
-class FSPatcher:
+# =============================================================================
+# Reciprocal helpers
+# =============================================================================
+
+
+def _wrap_unit_interval(x, tol=1e-12):
+    x = np.asarray(x, dtype=float)
+    x = x - np.floor(x)
+    x[np.isclose(x, 1.0, atol=tol)] = 0.0
+    x[np.isclose(x, 0.0, atol=tol)] = 0.0
+    return x
+
+
+def _B(model) -> np.ndarray:
+    return np.column_stack([
+        np.asarray(model.b1, dtype=float),
+        np.asarray(model.b2, dtype=float),
+    ])
+
+
+def _cart_to_red(model, k):
+    return np.linalg.solve(_B(model), np.asarray(k, dtype=float))
+
+
+def _red_to_cart(model, uv):
+    return _B(model) @ np.asarray(uv, dtype=float)
+
+
+def _canonicalize_k_mod_G(model, k):
     """
-    Periodized contour-based patcher for 2D models.
-
-    Key changes compared with the old version
-    -----------------------------------------
-    1. Default contour level is the exact target mu.
-    2. Contours are extracted in an extended periodic window in reduced coords,
-       so Fermi surfaces crossing the first BZ boundary are not clipped first.
-    3. Low-|vF| stationary points are kept as anchors. For kagome van Hove with
-       Npatch=6 and mu=0 this should recover the six M points automatically.
+    Parallelogram fundamental-domain rep.
+    只用于 modulo-G 等价类检查，不用于 centered 1BZ 可视化。
     """
+    uv = _cart_to_red(model, k)
+    uv = _wrap_unit_interval(uv)
+    k_can = _red_to_cart(model, uv)
+    k_can[np.isclose(k_can, 0.0, atol=1e-12)] = 0.0
+    return k_can
 
-    def __init__(
-        self,
-        model,
-        *,
-        band_index: int,
-        filling: Optional[float] = None,
-        mu: Optional[float] = None,
-        grid_size: int = 320,
-        Npatch: int = 48,
-        fd_step: float = 1e-4,
-        orbital_slice: Optional[slice] = None,
-        contour_min_points: int = 40,
-        contour_target_k: Optional[np.ndarray] = None,
-        auto_level_shifts: Optional[List[float]] = None,
-        prefer_closed_contour: bool = True,
-        gauge_fix: Optional[str] = "parallel_transport",
-        gauge_anchor: str = "max_component",
-        close_loop_gauge: bool = True,
-        verbose: bool = False,
-        strict_mu_contour: bool = True,
-        allow_level_shift_fallback: bool = False,
-        anchor_stationary_points: bool = True,
-        stationary_vf_rel_tol: float = 1e-2,
-        fs_energy_tol: float = 1e-10,
-        periodized_padding_red: float = 0.5,
-    ):
-        self.model = model
-        self.band_index = band_index
-        self.filling = filling
-        self.mu = mu
-        self.grid_size = grid_size
-        self.Npatch = Npatch
-        self.fd_step = fd_step
-        self.orbital_slice = orbital_slice
-        self.contour_min_points = contour_min_points
-        self.contour_target_k = None if contour_target_k is None else np.asarray(contour_target_k, dtype=float)
-        self.prefer_closed_contour = prefer_closed_contour
-        self.gauge_fix = gauge_fix
-        self.gauge_anchor = gauge_anchor
-        self.close_loop_gauge = close_loop_gauge
-        self.verbose = verbose
 
-        self.strict_mu_contour = bool(strict_mu_contour)
-        self.allow_level_shift_fallback = bool(allow_level_shift_fallback)
-        self.anchor_stationary_points = bool(anchor_stationary_points)
-        self.stationary_vf_rel_tol = float(stationary_vf_rel_tol)
-        self.fs_energy_tol = float(fs_energy_tol)
-        self.periodized_padding_red = float(periodized_padding_red)
+def _minimum_image_displacement(k_target, k_ref, model) -> np.ndarray:
+    k_target = np.asarray(k_target, dtype=float)
+    k_ref = np.asarray(k_ref, dtype=float)
+    b1 = np.asarray(model.b1, dtype=float)
+    b2 = np.asarray(model.b2, dtype=float)
 
-        if auto_level_shifts is None:
-            self.auto_level_shifts = [0.0]
+    best = None
+    best_norm = np.inf
+    for n1 in (-1, 0, 1):
+        for n2 in (-1, 0, 1):
+            disp = k_target - (k_ref + n1 * b1 + n2 * b2)
+            nd = np.linalg.norm(disp)
+            if nd < best_norm:
+                best_norm = nd
+                best = disp
+    return np.asarray(best, dtype=float)
+
+
+def _periodic_distance(k1, k2, model) -> float:
+    return float(np.linalg.norm(_minimum_image_displacement(k1, k2, model)))
+
+
+# =============================================================================
+# 1BZ geometry: centered hexagon, consistent with notebook helper
+# =============================================================================
+
+
+def hex_bz_vertices(model):
+    """
+    Standard centered 1BZ hexagon vertices for triangular/kagome reciprocal lattice.
+
+    For reciprocal vectors b1, b2:
+        ±(2b1-b2)/3, ±(b1+b2)/3, ±(-b1+2b2)/3
+    """
+    b1 = np.asarray(model.b1, dtype=float)
+    b2 = np.asarray(model.b2, dtype=float)
+
+    verts = np.array([
+        (2 * b1 - b2) / 3.0,
+        (b1 + b2) / 3.0,
+        (-b1 + 2 * b2) / 3.0,
+        -(2 * b1 - b2) / 3.0,
+        -(b1 + b2) / 3.0,
+        -(-b1 + 2 * b2) / 3.0,
+    ], dtype=float)
+
+    ang = np.arctan2(verts[:, 1], verts[:, 0])
+    order = np.argsort(ang)
+    return verts[order]
+
+
+def exact_M6_points_1bz(model):
+    """
+    6 geometric M points on the boundary of the centered 1BZ hexagon.
+    """
+    V = hex_bz_vertices(model)
+    M = []
+
+    n = len(V)
+    for i in range(n):
+        v0 = V[i]
+        v1 = V[(i + 1) % n]
+        M.append(0.5 * (v0 + v1))
+
+    M = np.asarray(M, dtype=float)
+    ang = np.arctan2(M[:, 1], M[:, 0])
+    order = np.argsort(ang)
+    return M[order]
+
+
+def _point_in_convex_polygon(point: np.ndarray, polygon: np.ndarray, tol: float = 1e-10) -> bool:
+    p = np.asarray(point, dtype=float)
+    poly = np.asarray(polygon, dtype=float)
+    n = len(poly)
+
+    sign = None
+    for i in range(n):
+        a = poly[i]
+        b = poly[(i + 1) % n]
+        cross = np.cross(b - a, p - a)
+        if abs(cross) <= tol:
+            continue
+        this_sign = cross > 0
+        if sign is None:
+            sign = this_sign
+        elif sign != this_sign:
+            return False
+    return True
+
+
+def canonicalize_k_to_centered_1bz(model, k, *, search_range: int = 2) -> np.ndarray:
+    """
+    Choose a reciprocal-lattice-shifted representative in the centered hexagonal 1BZ.
+    """
+    k = np.asarray(k, dtype=float)
+    b1 = np.asarray(model.b1, dtype=float)
+    b2 = np.asarray(model.b2, dtype=float)
+    poly = hex_bz_vertices(model)
+
+    candidates = []
+    for n1 in range(-search_range, search_range + 1):
+        for n2 in range(-search_range, search_range + 1):
+            kc = k - n1 * b1 - n2 * b2
+            if _point_in_convex_polygon(kc, poly, tol=1e-10):
+                candidates.append(kc)
+
+    if len(candidates) == 0:
+        best = None
+        best_norm = np.inf
+        for n1 in range(-search_range, search_range + 1):
+            for n2 in range(-search_range, search_range + 1):
+                kc = k - n1 * b1 - n2 * b2
+                nd = float(np.linalg.norm(kc))
+                if nd < best_norm:
+                    best = kc
+                    best_norm = nd
+        out = np.asarray(best, dtype=float)
+    else:
+        out = np.asarray(min(candidates, key=lambda x: float(np.linalg.norm(x))), dtype=float)
+
+    out[np.isclose(out, 0.0, atol=1e-12)] = 0.0
+    return out
+
+
+# =============================================================================
+# Notebook-consistent exact-M loop generators
+# =============================================================================
+
+def _edge_cluster_parameter(u, alpha=1.0):
+    """
+    Map u in [0,1] to t in [0,1], clustering points near both endpoints.
+    alpha = 1 -> uniform
+    alpha > 1 -> more concentrated near 0 and 1
+    """
+    u = np.asarray(u, dtype=float)
+    x = 2.0 * u - 1.0
+    y = np.sign(x) * np.abs(x) ** alpha
+    return 0.5 * (y + 1.0)
+    
+def exact_M_hex_loop_points(model, points_per_edge=1, *, edge_cluster_alpha=1.0):
+    if points_per_edge < 1:
+        raise ValueError("points_per_edge must be >= 1")
+
+    M6 = exact_M6_points_1bz(model)
+    pts = []
+
+    n = len(M6)
+    for i in range(n):
+        k0 = M6[i]
+        k1 = M6[(i + 1) % n]
+        for m in range(points_per_edge):
+            u = m / points_per_edge
+            t = _edge_cluster_parameter(u, alpha=edge_cluster_alpha)
+            k = (1.0 - t) * k0 + t * k1
+            pts.append(k)
+
+    return np.asarray(pts, dtype=float)
+
+
+def _ray_polygon_first_intersection(theta, vertices, *, tol=1e-12):
+    vertices = np.asarray(vertices, dtype=float)
+    e = np.array([np.cos(theta), np.sin(theta)], dtype=float)
+
+    hits = []
+    nv = len(vertices)
+    for i in range(nv):
+        A = vertices[i]
+        B = vertices[(i + 1) % nv]
+        d = B - A
+
+        M = np.column_stack([e, -d])
+        det = np.linalg.det(M)
+        if abs(det) < tol:
+            continue
+
+        r, t = np.linalg.solve(M, A)
+        if r >= -tol and (-tol <= t <= 1 + tol):
+            r = max(r, 0.0)
+            t = min(max(t, 0.0), 1.0)
+            P = A + t * d
+            hits.append((r, i, P))
+
+    if not hits:
+        raise ValueError(f"No polygon intersection found for theta={theta}")
+
+    hits.sort(key=lambda x: x[0])
+    rmin, edge_index, P = hits[0]
+    return np.asarray(P, dtype=float), int(edge_index), float(rmin)
+
+
+def exact_M_hex_loop_points_global_angular(model, points_per_edge=1, *, angle_offset=0.0):
+    """
+    Global-uniform angular sampling, same spirit as your helper txt.
+    """
+    p = int(points_per_edge)
+    if p <= 0:
+        raise ValueError("points_per_edge must be >= 1")
+
+    M6 = np.asarray(exact_M6_points_1bz(model), dtype=float)
+    th_v = np.arctan2(M6[:, 1], M6[:, 0])
+    order = np.argsort(th_v)
+    poly = M6[order]
+
+    N = 6 * p
+    theta0 = float(np.arctan2(poly[0, 1], poly[0, 0])) + float(angle_offset)
+    thetas = theta0 + 2.0 * np.pi * np.arange(N) / N
+
+    pts = []
+    for th in thetas:
+        P, _, _ = _ray_polygon_first_intersection(th, poly)
+        pts.append(P)
+
+    return np.asarray(pts, dtype=float)
+
+
+# =============================================================================
+# duplicated-M removal (same notebook semantics)
+# =============================================================================
+
+
+def _patch_keep_indices_remove_duplicate_M_anchors(model, points_per_edge, tol=1e-10):
+    """
+    Same behavior as your helper txt:
+    only the 6 anchor points are checked modulo G.
+    """
+    p = int(points_per_edge)
+    n_full = 6 * p
+    keep = np.ones(n_full, dtype=bool)
+
+    anchor_ids = [i * p for i in range(6)]
+    M6 = exact_M6_points_1bz(model)
+
+    seen_classes = []
+    for local_anchor_idx, global_idx in enumerate(anchor_ids):
+        k = M6[local_anchor_idx]
+        k_can = _canonicalize_k_mod_G(model, k)
+
+        duplicated = False
+        for q_can in seen_classes:
+            if np.linalg.norm(k_can - q_can) < tol:
+                duplicated = True
+                break
+
+        if duplicated:
+            keep[global_idx] = False
         else:
-            self.auto_level_shifts = list(auto_level_shifts)
+            seen_classes.append(k_can)
 
-        if (filling is None) == (mu is None):
-            raise ValueError("Exactly one of filling or mu must be provided.")
+    return np.flatnonzero(keep)
 
-        valid_gauges = {None, "parallel_transport"}
-        if self.gauge_fix not in valid_gauges:
-            raise ValueError(
-                f"Unsupported gauge_fix={self.gauge_fix!r}. Valid choices: {sorted(valid_gauges, key=str)}"
-            )
 
-    # ------------------------
-    # reciprocal helpers
-    # ------------------------
-    @property
-    def b1(self) -> np.ndarray:
-        return np.asarray(self.model.b1, dtype=float)
+def _patch_keep_indices_exclude_strict_M_anchors(points_per_edge):
+    p = int(points_per_edge)
+    if p < 2:
+        raise ValueError(
+            "keep_strict_M_anchors=False requires points_per_edge >= 2, "
+            "because for points_per_edge=1 all loop points are strict M anchors."
+        )
 
-    @property
-    def b2(self) -> np.ndarray:
-        return np.asarray(self.model.b2, dtype=float)
+    n_full = 6 * p
+    keep = np.ones(n_full, dtype=bool)
+    strict_M_ids = [i * p for i in range(6)]
+    keep[strict_M_ids] = False
+    return np.flatnonzero(keep)
 
-    @property
-    def Bmat(self) -> np.ndarray:
-        return np.column_stack([self.b1, self.b2])
 
-    @property
-    def Binv(self) -> np.ndarray:
-        return np.linalg.inv(self.Bmat)
+# =============================================================================
+# Sector eigensystem / velocity / FS projection
+# =============================================================================
 
-    def red_to_cart(self, uv: np.ndarray) -> np.ndarray:
-        uv = np.asarray(uv, dtype=float)
-        return self.Bmat @ uv
 
-    def cart_to_red(self, k: np.ndarray) -> np.ndarray:
-        k = np.asarray(k, dtype=float)
-        return self.Binv @ k
+def _sector_hamiltonian(model, k, orbital_slice):
+    k = np.asarray(k, dtype=float)
+    H = np.asarray(model.Hk(k[0], k[1]), dtype=complex)
+    if orbital_slice is None:
+        return H
+    return H[orbital_slice, orbital_slice]
 
-    def wrap_red(self, uv: np.ndarray) -> np.ndarray:
-        uv = np.asarray(uv, dtype=float)
-        uv = uv - np.floor(uv)
-        uv[np.isclose(uv, 1.0, atol=1e-12)] = 0.0
-        uv[np.isclose(uv, 0.0, atol=1e-12)] = 0.0
-        return uv
 
-    def wrap_cart(self, k: np.ndarray) -> np.ndarray:
-        return self.red_to_cart(self.wrap_red(self.cart_to_red(k)))
+def _sector_eig(model, k, orbital_slice, band_index):
+    H = _sector_hamiltonian(model, k, orbital_slice)
+    evals, evecs = np.linalg.eigh(H)
+    if not (0 <= band_index < len(evals)):
+        raise ValueError(
+            f"band_index={band_index} out of range for sector with {len(evals)} bands"
+        )
+    return float(evals[band_index]), np.asarray(evecs[:, band_index], dtype=complex)
 
-    # ------------------------
-    # sector / band helpers
-    # ------------------------
-    def _full_hamiltonian(self, kx: float, ky: float) -> np.ndarray:
-        return np.asarray(self.model.Hk(kx, ky), dtype=complex)
 
-    def _sector_hamiltonian(self, kx: float, ky: float) -> np.ndarray:
-        H = self._full_hamiltonian(kx, ky)
-        if self.orbital_slice is None:
-            return H
-        return H[self.orbital_slice, self.orbital_slice]
+def _finite_diff_velocity(model, k, orbital_slice, band_index, h=1e-5):
+    k = np.asarray(k, dtype=float)
 
-    def _sector_eigenstate(self, kx: float, ky: float):
-        H = self._sector_hamiltonian(kx, ky)
-        evals, evecs = np.linalg.eigh(H)
-        return evals, evecs
+    ex1, _ = _sector_eig(model, [k[0] + h, k[1]], orbital_slice, band_index)
+    ex2, _ = _sector_eig(model, [k[0] - h, k[1]], orbital_slice, band_index)
+    ey1, _ = _sector_eig(model, [k[0], k[1] + h], orbital_slice, band_index)
+    ey2, _ = _sector_eig(model, [k[0], k[1] - h], orbital_slice, band_index)
 
-    def _validate_band_index(self, nband: int):
-        if not (0 <= self.band_index < nband):
-            raise ValueError(
-                f"band_index={self.band_index} out of range for current sector with {nband} bands."
-            )
+    return np.array([(ex1 - ex2) / (2.0 * h), (ey1 - ey2) / (2.0 * h)], dtype=float)
 
-    # ------------------------
-    # band / eigvec / mu
-    # ------------------------
-    def band_energy(self, kx: float, ky: float) -> float:
-        evals, _ = self._sector_eigenstate(kx, ky)
-        self._validate_band_index(len(evals))
-        return float(evals[self.band_index])
 
-    def band_eigvec(self, kx: float, ky: float) -> np.ndarray:
-        _, evecs = self._sector_eigenstate(kx, ky)
-        self._validate_band_index(evecs.shape[1])
-        return np.asarray(evecs[:, self.band_index], dtype=complex)
+def project_to_fs(
+    model,
+    k0,
+    orbital_slice,
+    band_index,
+    *,
+    mu=0.0,
+    nstep=40,
+    tol=1e-12,
+    fd_step=1e-5,
+):
+    """
+    Newton projection onto E(k)=mu using the velocity direction.
 
-    def get_mu(self) -> float:
-        if self.mu is not None:
-            return float(self.mu)
-        return float(self.model.EF_from_filling(self.filling))
+    这是这次相对 notebook helper 的“刻意升级”：
+    你的 helper 本身只给 manual loop，并不保证 E=mu；
+    但你现在明确希望 patch energy 尽量是 0，所以这里默认加上。
+    """
+    k = canonicalize_k_to_centered_1bz(model, k0)
 
-    # ------------------------
-    # velocity / orbital weight
-    # ------------------------
-    def fermi_velocity(self, kx: float, ky: float) -> np.ndarray:
-        h = self.fd_step
-        ex1 = self.band_energy(kx + h, ky)
-        ex2 = self.band_energy(kx - h, ky)
-        ey1 = self.band_energy(kx, ky + h)
-        ey2 = self.band_energy(kx, ky - h)
-        vx = (ex1 - ex2) / (2.0 * h)
-        vy = (ey1 - ey2) / (2.0 * h)
-        return np.array([vx, vy], dtype=float)
+    for _ in range(nstep):
+        e, _ = _sector_eig(model, k, orbital_slice, band_index)
+        de = e - mu
+        if abs(de) < tol:
+            return canonicalize_k_to_centered_1bz(model, k)
 
-    def orbital_weight(self, eigvec: np.ndarray) -> np.ndarray:
-        vec = np.asarray(eigvec, dtype=complex)
-        w = np.abs(vec) ** 2
-        s = np.sum(w)
-        if s > 0:
-            w = w / s
-        return w
+        v = _finite_diff_velocity(model, k, orbital_slice, band_index, h=fd_step)
+        vv = float(np.dot(v, v))
+        if vv < 1e-20:
+            return canonicalize_k_to_centered_1bz(model, k)
 
-    # ------------------------
-    # gauge helpers
-    # ------------------------
-    @staticmethod
-    def _normalize_eigvec(u: np.ndarray) -> np.ndarray:
-        u = np.asarray(u, dtype=complex)
-        nrm = np.linalg.norm(u)
-        if nrm == 0:
-            raise ValueError("Encountered zero-norm eigenvector.")
-        return u / nrm
+        k = k - (de / vv) * v
+        k = canonicalize_k_to_centered_1bz(model, k)
 
-    def _anchor_phase(self, u: np.ndarray) -> np.ndarray:
-        u = self._normalize_eigvec(u)
-        if self.gauge_anchor == "max_component":
-            idx = int(np.argmax(np.abs(u)))
-            if np.abs(u[idx]) > 0:
-                u = u * np.exp(-1j * np.angle(u[idx]))
-        elif self.gauge_anchor == "first_component":
-            if np.abs(u[0]) > 0:
-                u = u * np.exp(-1j * np.angle(u[0]))
+    return canonicalize_k_to_centered_1bz(model, k)
+
+
+def _normalize_eigvec(u):
+    u = np.asarray(u, dtype=complex)
+    nrm = np.linalg.norm(u)
+    if nrm == 0:
+        raise ValueError("Encountered zero-norm eigenvector.")
+    return u / nrm
+
+
+def _orbital_weight(u):
+    u = np.asarray(u, dtype=complex)
+    w = np.abs(u) ** 2
+    s = float(np.sum(w))
+    return w / s if s > 0 else w
+
+
+# =============================================================================
+# Gauge fixing
+# =============================================================================
+
+
+def _anchor_phase(u, method="max_component"):
+    u = _normalize_eigvec(u)
+    if method == "max_component":
+        idx = int(np.argmax(np.abs(u)))
+        if np.abs(u[idx]) > 0:
+            u = u * np.exp(-1j * np.angle(u[idx]))
+    elif method == "first_component":
+        if np.abs(u[0]) > 0:
+            u = u * np.exp(-1j * np.angle(u[0]))
+    else:
+        raise ValueError("method must be 'max_component' or 'first_component'")
+    return u
+
+
+def smooth_patch_eigvecs(eigvecs, *, close_loop=True, anchor_method="max_component"):
+    U = np.asarray(eigvecs, dtype=complex).copy()
+    if U.ndim != 2:
+        raise ValueError("eigvecs must have shape (Npatch, Norb).")
+
+    N = U.shape[0]
+    if N == 0:
+        return U, 0.0
+
+    U[0] = _anchor_phase(U[0], method=anchor_method)
+
+    for p in range(1, N):
+        U[p] = _normalize_eigvec(U[p])
+        ov = np.vdot(U[p - 1], U[p])
+        if np.abs(ov) > 1e-14:
+            U[p] *= np.exp(-1j * np.angle(ov))
         else:
-            raise ValueError("gauge_anchor must be 'max_component' or 'first_component'.")
-        return u
+            U[p] = _anchor_phase(U[p], method=anchor_method)
 
-    def smooth_patch_eigvecs(self, eigvecs: np.ndarray) -> Tuple[np.ndarray, float]:
-        U = np.asarray(eigvecs, dtype=complex).copy()
-        if U.ndim != 2:
-            raise ValueError("eigvecs must be a 2D array of shape (Npatch, Norb).")
-        N = U.shape[0]
-        if N == 0:
-            return U, 0.0
+    loop_phase = 0.0
+    if N > 1:
+        ov_last = np.vdot(U[-1], U[0])
+        if np.abs(ov_last) > 1e-14:
+            loop_phase = float(np.angle(ov_last))
 
-        U[0] = self._anchor_phase(U[0])
+    if close_loop and N > 1 and np.abs(loop_phase) > 1e-14:
+        for p in range(N):
+            U[p] *= np.exp(1j * (p / N) * loop_phase)
 
+        U[0] = _anchor_phase(U[0], method=anchor_method)
         for p in range(1, N):
-            U[p] = self._normalize_eigvec(U[p])
             ov = np.vdot(U[p - 1], U[p])
             if np.abs(ov) > 1e-14:
                 U[p] *= np.exp(-1j * np.angle(ov))
-            else:
-                U[p] = self._anchor_phase(U[p])
 
+    for p in range(N):
+        U[p] = _normalize_eigvec(U[p])
+
+    return U, loop_phase
+
+
+# =============================================================================
+# Patch geometry on the kept loop
+# =============================================================================
+
+
+def _compute_patch_arc_lengths(k_points: np.ndarray, model) -> np.ndarray:
+    k_points = np.asarray(k_points, dtype=float)
+    n = len(k_points)
+    out = np.zeros(n, dtype=float)
+
+    if n == 0:
+        return out
+    if n == 1:
+        return out
+
+    for p in range(n):
+        km = k_points[(p - 1) % n]
+        k0 = k_points[p]
+        kp = k_points[(p + 1) % n]
+
+        d_left = _periodic_distance(k0, km, model)
+        d_right = _periodic_distance(kp, k0, model)
+        out[p] = 0.5 * (d_left + d_right)
+
+    return out
+
+
+def _compute_tangent_normal(k_points: np.ndarray, model) -> Tuple[np.ndarray, np.ndarray]:
+    k_points = np.asarray(k_points, dtype=float)
+    n = len(k_points)
+
+    tangents = np.zeros((n, 2), dtype=float)
+    normals = np.zeros((n, 2), dtype=float)
+
+    if n == 0:
+        return tangents, normals
+
+    for p in range(n):
+        km = k_points[(p - 1) % n]
+        kp = k_points[(p + 1) % n]
+
+        dm = _minimum_image_displacement(k_points[p], km, model)
+        dp = _minimum_image_displacement(kp, k_points[p], model)
+
+        t = dm + dp
+        nt = np.linalg.norm(t)
+        if nt < 1e-14:
+            t = dp if np.linalg.norm(dp) > np.linalg.norm(dm) else dm
+            nt = np.linalg.norm(t)
+
+        if nt < 1e-14:
+            tangents[p] = np.array([1.0, 0.0], dtype=float)
+            normals[p] = np.array([0.0, 1.0], dtype=float)
+            continue
+
+        t = t / nt
+        tangents[p] = t
+        normals[p] = np.array([-t[1], t[0]], dtype=float)
+
+    return tangents, normals
+
+
+# =============================================================================
+# Internal builder
+# =============================================================================
+
+
+def _build_patchset_from_loop(
+    model,
+    K_full,
+    orbital_slice,
+    band_index,
+    *,
+    points_per_edge=1,
+    remove_duplicate_M_modG=False,
+    keep_strict_M_anchors=True,
+    gauge_fix=True,
+    close_loop_gauge=True,
+    gauge_anchor="max_component",
+    project_to_fs_points=True,
+    mu=0.0,
+    fd_step=1e-5,
+    builder_name="manual_exact_M_hex",
+):
+    if not keep_strict_M_anchors:
+        keep_idx = _patch_keep_indices_exclude_strict_M_anchors(points_per_edge)
+    elif remove_duplicate_M_modG:
+        keep_idx = _patch_keep_indices_remove_duplicate_M_anchors(
+            model,
+            points_per_edge=points_per_edge,
+        )
+    else:
+        keep_idx = np.arange(len(K_full))
+
+    K_patch0 = np.asarray(K_full[keep_idx], dtype=float)
+
+    if project_to_fs_points:
+        K_patch = np.asarray(
+            [
+                project_to_fs(
+                    model,
+                    k,
+                    orbital_slice,
+                    band_index,
+                    mu=mu,
+                    fd_step=fd_step,
+                )
+                for k in K_patch0
+            ],
+            dtype=float,
+        )
+    else:
+        K_patch = np.asarray(
+            [canonicalize_k_to_centered_1bz(model, k) for k in K_patch0],
+            dtype=float,
+        )
+
+    # for plotting, canonicalize the full loop to the centered 1BZ too
+    K_full_plot = np.asarray(
+        [canonicalize_k_to_centered_1bz(model, k) for k in K_full],
+        dtype=float,
+    )
+
+    bz_vertices = hex_bz_vertices(model)
+
+    raw_eigvecs = []
+    energies = []
+    velocities = []
+
+    for k in K_patch:
+        e, u = _sector_eig(model, k, orbital_slice, band_index)
+        vF = _finite_diff_velocity(model, k, orbital_slice, band_index, h=fd_step)
+
+        raw_eigvecs.append(u)
+        energies.append(e)
+        velocities.append(vF)
+
+    raw_eigvecs = np.asarray(raw_eigvecs, dtype=complex)
+
+    if gauge_fix:
+        fixed_eigvecs, loop_phase = smooth_patch_eigvecs(
+            raw_eigvecs,
+            close_loop=close_loop_gauge,
+            anchor_method=gauge_anchor,
+        )
+        gauge_method = f"{builder_name}_parallel_transport"
+    else:
+        fixed_eigvecs = np.asarray(
+            [_normalize_eigvec(u) for u in raw_eigvecs],
+            dtype=complex,
+        )
         loop_phase = 0.0
-        if N > 1:
-            ov_last = np.vdot(U[-1], U[0])
-            if np.abs(ov_last) > 1e-14:
-                loop_phase = float(np.angle(ov_last))
+        gauge_method = f"{builder_name}_raw"
 
-        if self.close_loop_gauge and N > 1 and np.abs(loop_phase) > 1e-14:
-            for p in range(N):
-                U[p] *= np.exp(1j * (p / N) * loop_phase)
-            U[0] = self._anchor_phase(U[0])
-            for p in range(1, N):
-                ov = np.vdot(U[p - 1], U[p])
-                if np.abs(ov) > 1e-14:
-                    U[p] *= np.exp(-1j * np.angle(ov))
+    arc = _compute_patch_arc_lengths(K_patch, model)
+    tangent, normal = _compute_tangent_normal(K_patch, model)
 
-        for p in range(N):
-            U[p] = self._normalize_eigvec(U[p])
-
-        return U, loop_phase
-
-    # ------------------------
-    # refine point to exact FS
-    # ------------------------
-    def project_to_fs(self, k0: np.ndarray, mu: float, nstep: int = 30) -> np.ndarray:
-        k = np.array(k0, dtype=float)
-        for _ in range(nstep):
-            e = self.band_energy(k[0], k[1])
-            de = e - mu
-            if abs(de) < self.fs_energy_tol:
-                return k
-            v = self.fermi_velocity(k[0], k[1])
-            vv = float(np.dot(v, v))
-            if vv < 1e-20:
-                # Stationary point on the FS: exactly what we want to preserve
-                return k
-            k = k - (de / vv) * v
-
-        e = self.band_energy(k[0], k[1])
-        if abs(e - mu) > max(self.fs_energy_tol, 1e-8):
-            raise RuntimeError(f"project_to_fs did not converge: final |E-mu|={abs(e - mu):.3e}")
-        return k
-
-    def refine_contour_to_true_fs(self, contour: np.ndarray, mu: float) -> np.ndarray:
-        return np.asarray([self.project_to_fs(k, mu) for k in np.asarray(contour, dtype=float)], dtype=float)
-
-    # ------------------------
-    # first BZ geometry
-    # ------------------------
-    def first_bz_vertices(self) -> np.ndarray:
-        Gs = []
-        for n1 in [-1, 0, 1]:
-            for n2 in [-1, 0, 1]:
-                if n1 == 0 and n2 == 0:
-                    continue
-                Gs.append(n1 * self.b1 + n2 * self.b2)
-        Gs = np.array(Gs, dtype=float)
-
-        norms = np.linalg.norm(Gs, axis=1)
-        min_norm = np.min(norms)
-        close = Gs[np.abs(norms - min_norm) < 1e-8]
-
-        verts = []
-        for i in range(len(close)):
-            for j in range(i + 1, len(close)):
-                G1 = close[i]
-                G2 = close[j]
-                A = np.array([G1, G2], dtype=float)
-                if abs(np.linalg.det(A)) < 1e-12:
-                    continue
-                rhs = np.array([np.dot(G1, G1) / 2.0, np.dot(G2, G2) / 2.0], dtype=float)
-                k = np.linalg.solve(A, rhs)
-
-                good = True
-                for G in close:
-                    if np.dot(k, G) - np.dot(G, G) / 2.0 > 1e-8:
-                        good = False
-                        break
-                if good:
-                    verts.append(k)
-
-        uniq = []
-        for v in np.asarray(verts, dtype=float):
-            if not any(np.linalg.norm(v - u) < 1e-8 for u in uniq):
-                uniq.append(v)
-        verts = np.asarray(uniq, dtype=float)
-
-        center = np.mean(verts, axis=0)
-        ang = np.arctan2(verts[:, 1] - center[1], verts[:, 0] - center[0])
-        return verts[np.argsort(ang)]
-
-    @staticmethod
-    def point_in_polygon(point: np.ndarray, polygon: np.ndarray) -> bool:
-        x, y = point
-        inside = False
-        n = len(polygon)
-        for i in range(n):
-            x1, y1 = polygon[i]
-            x2, y2 = polygon[(i + 1) % n]
-            if ((y1 > y) != (y2 > y)):
-                xinters = (x2 - x1) * (y - y1) / (y2 - y1 + 1e-30) + x1
-                if x < xinters:
-                    inside = not inside
-        return inside
-
-    # ------------------------
-    # periodized energy grid + contour extraction
-    # ------------------------
-    def build_energy_grid_periodized(self):
-        """
-        Build E(k) on an extended periodic window in reduced coordinates.
-
-        We evaluate the energy on wrapped k, but keep the unwrapped cartesian
-        coordinates for contour geometry. This avoids clipping a contour at the
-        first-BZ boundary before we know which periodic representative is correct.
-        """
-        pad = self.periodized_padding_red
-        us = np.linspace(-pad, 1.0 + pad, self.grid_size)
-        vs = np.linspace(-pad, 1.0 + pad, self.grid_size)
-        U, V = np.meshgrid(us, vs, indexing="xy")
-
-        KX = np.zeros_like(U, dtype=float)
-        KY = np.zeros_like(V, dtype=float)
-        E = np.zeros_like(U, dtype=float)
-
-        for i in range(U.shape[0]):
-            for j in range(U.shape[1]):
-                uv = np.array([U[i, j], V[i, j]], dtype=float)
-                k_ext = self.red_to_cart(uv)
-                k_phys = self.red_to_cart(self.wrap_red(uv))
-                KX[i, j] = k_ext[0]
-                KY[i, j] = k_ext[1]
-                E[i, j] = self.band_energy(k_phys[0], k_phys[1])
-
-        return KX, KY, E, self.first_bz_vertices()
-
-    def extract_fs_contours_periodized(self, KX, KY, E, mu_level):
-        import matplotlib.pyplot as plt
-
-        fig = plt.figure()
-        ax = fig.add_subplot(111)
-        cs = ax.contour(KX, KY, E, levels=[mu_level])
-        plt.close(fig)
-
-        contours = []
-        if len(cs.allsegs) == 0 or len(cs.allsegs[0]) == 0:
-            return contours
-
-        for seg in cs.allsegs[0]:
-            if seg.shape[0] >= self.contour_min_points:
-                contours.append(np.array(seg, dtype=float))
-        return contours
-
-    # ------------------------
-    # contour helpers / scoring
-    # ------------------------
-    @staticmethod
-    def contour_length(contour: np.ndarray, closed: bool = True) -> float:
-        if contour.shape[0] < 2:
-            return 0.0
-        diffs = np.diff(contour, axis=0)
-        length = np.sum(np.linalg.norm(diffs, axis=1))
-        if closed:
-            length += np.linalg.norm(contour[0] - contour[-1])
-        return float(length)
-
-    def is_contour_closed(self, contour: np.ndarray, tol: float = 5e-2) -> bool:
-        if contour.shape[0] < 3:
-            return False
-        return np.linalg.norm(contour[0] - contour[-1]) < tol
-
-    def contour_centroid(self, contour: np.ndarray) -> np.ndarray:
-        return np.mean(contour, axis=0)
-
-    def polygon_contains_point(self, contour: np.ndarray, point: np.ndarray) -> bool:
-        return self.point_in_polygon(point, contour)
-
-    def close_contour_if_needed(self, contour: np.ndarray) -> np.ndarray:
-        if contour.shape[0] < 2:
-            return contour
-        if np.linalg.norm(contour[0] - contour[-1]) > 1e-10:
-            contour = np.vstack([contour, contour[0]])
-        return contour
-
-    def detect_stationary_anchors_on_contour(self, contour: np.ndarray, mu: float) -> np.ndarray:
-        """
-        Detect low-|vF| local minima along the contour.
-
-        This is model-agnostic and preserves van-Hove / saddle points when present.
-        """
-        contour = np.asarray(contour, dtype=float)
-        if contour.shape[0] < 3:
-            return np.zeros((0, 2), dtype=float)
-
-        loop = self.close_contour_if_needed(contour)
-        pts = loop[:-1]
-        pts_refined = np.array([self.project_to_fs(k, mu) for k in pts], dtype=float)
-        vnorm = np.array([np.linalg.norm(self.fermi_velocity(k[0], k[1])) for k in pts_refined], dtype=float)
-
-        vmax = float(np.max(vnorm)) if len(vnorm) else 0.0
-        if vmax <= 0:
-            return pts_refined.copy()
-
-        thresh = self.stationary_vf_rel_tol * vmax
-
-        cand = []
-        n = len(vnorm)
-        for i in range(n):
-            im = (i - 1) % n
-            ip = (i + 1) % n
-            if vnorm[i] <= vnorm[im] and vnorm[i] <= vnorm[ip] and vnorm[i] <= thresh:
-                cand.append(i)
-
-        if len(cand) == 0:
-            return np.zeros((0, 2), dtype=float)
-
-        anchors = []
-        for idx in cand:
-            k = pts_refined[idx]
-            if not any(np.linalg.norm(k - a) < 1e-6 for a in anchors):
-                anchors.append(k)
-
-        anchors = np.asarray(anchors, dtype=float)
-        if anchors.shape[0] == 0:
-            return anchors
-
-        center = np.mean(anchors, axis=0)
-        ang = np.arctan2(anchors[:, 1] - center[1], anchors[:, 0] - center[0])
-        return anchors[np.argsort(ang)]
-
-    def _contour_score_with_anchors(self, contour: np.ndarray, anchors: np.ndarray) -> Tuple:
-        closed = self.is_contour_closed(contour, tol=5e-2)
-        length = self.contour_length(contour, closed=closed)
-
-        target = np.zeros(2, dtype=float) if self.contour_target_k is None else np.asarray(self.contour_target_k, dtype=float)
-
-        encloses_target = False
-        if closed:
-            try:
-                encloses_target = self.polygon_contains_point(contour, target)
-            except Exception:
-                encloses_target = False
-
-        centroid = self.contour_centroid(contour)
-        target_dist = float(np.linalg.norm(centroid - target))
-
-        return (
-            int(anchors.shape[0]),                                # more stationary anchors is better
-            1 if (self.prefer_closed_contour and closed) else 0,  # closed preferred
-            1 if encloses_target else 0,                          # central rep preferred
-            float(length),                                        # longer preferred
-            -target_dist,                                         # closer centroid to target preferred
+    patches = []
+    for pid, (k, e, vF, u, ell, t, n) in enumerate(
+        zip(K_patch, energies, velocities, fixed_eigvecs, arc, tangent, normal)
+    ):
+        vf_norm = float(np.linalg.norm(vF))
+        patches.append(
+            PatchPoint(
+                patch_id=pid,
+                k_cart=np.asarray(k, dtype=float),
+                k_red=_cart_to_red(model, k),
+                energy=float(e),
+                vF=np.asarray(vF, dtype=float),
+                vF_norm=vf_norm,
+                eigvec=np.asarray(u, dtype=complex),
+                orbital_weight=_orbital_weight(u),
+                tangent=np.asarray(t, dtype=float),
+                normal=np.asarray(n, dtype=float),
+                fs_arc_length=float(ell),
+                weight_length=float(ell),
+                weight_length_over_vf=float(ell / vf_norm) if vf_norm > 1e-14 else np.inf,
+            )
         )
 
-    def choose_best_contour_exact_mu(self, KX, KY, E, mu):
-        contours = self.extract_fs_contours_periodized(KX, KY, E, mu)
-        if len(contours) == 0:
-            raise RuntimeError(
-                f"No valid FS contour found exactly at mu={mu:.12g}. Increase grid_size or enable fallback explicitly."
-            )
+    npatch = len(K_patch)
+    suffix_dup = "_dropDupM" if (keep_strict_M_anchors and remove_duplicate_M_modG) else ""
+    suffix_noM = "_noStrictM" if (not keep_strict_M_anchors) else ""
+    suffix_g = "_gaugeFixed" if gauge_fix else "_rawGauge"
+    suffix_fs = "_projFS" if project_to_fs_points else "_rawLoop"
 
-        best = None
-        best_anchors = None
-        for c in contours:
-            c_ref = self.refine_contour_to_true_fs(c, mu)
-            anchors = (
-                self.detect_stationary_anchors_on_contour(c_ref, mu)
-                if self.anchor_stationary_points
-                else np.zeros((0, 2), dtype=float)
-            )
-            key = self._contour_score_with_anchors(c_ref, anchors)
-            if self.verbose:
-                print(
-                    f"[FSPatcher] exact-mu contour: "
-                    f"closed={self.is_contour_closed(c_ref)} "
-                    f"n_anchor={anchors.shape[0]} key={key}"
-                )
-            if best is None or key > best[0]:
-                best = (key, c_ref)
-                best_anchors = anchors
+    return PatchSet(
+        mu=float(mu),
+        mu_used_for_contour=float(mu),
+        band_index=int(band_index),
+        filling=np.nan,
+        patches=patches,
+        # fs_contour_k=np.asarray(K_full_plot, dtype=float),
+        fs_contour_k=np.asarray(np.asarray(exact_M6_points_1bz(model), dtype=float), dtype=float),
+        bz_vertices=np.asarray(bz_vertices, dtype=float),
+        b1=np.asarray(model.b1, dtype=float),
+        b2=np.asarray(model.b2, dtype=float),
+        gauge_method=f"{gauge_method}_{npatch}{suffix_dup}{suffix_noM}{suffix_g}{suffix_fs}",
+        gauge_loop_phase=float(loop_phase),
+        name=f"{builder_name}_{npatch}",
+        model_name=type(model).__name__,
+        metadata={
+            "builder": builder_name,
+            "points_per_edge": int(points_per_edge),
+            "remove_duplicate_M_modG": bool(remove_duplicate_M_modG),
+            "keep_strict_M_anchors": bool(keep_strict_M_anchors),
+            "project_to_fs_points": bool(project_to_fs_points),
+            "kept_indices": keep_idx.tolist(),
+        },
+    )
 
-        return best[1], float(mu), best_anchors
 
-    def choose_best_contour_over_shifts(self, KX, KY, E, mu):
-        best = None
-        best_anchors = None
+# =============================================================================
+# Public builders
+# =============================================================================
 
-        for shift in self.auto_level_shifts:
-            mu_level = mu + shift
-            contours = self.extract_fs_contours_periodized(KX, KY, E, mu_level)
 
-            if self.verbose:
-                print(f"[FSPatcher] shift={shift:.2e}, n_contours={len(contours)}")
+def build_exactM_patchset(
+    model,
+    orbital_slice,
+    band_index,
+    *,
+    points_per_edge=1,
+    remove_duplicate_M_modG=False,
+    keep_strict_M_anchors=True,
+    gauge_fix=True,
+    close_loop_gauge=True,
+    gauge_anchor="max_component",
+    project_to_fs_points=True,
+    mu=0.0,
+    fd_step=1e-5,
+    edge_cluster_alpha=1.0,
+):
+    """
+    Notebook-consistent manual exact-M builder using per-edge interpolation,
+    plus two deliberate fixes:
+      1. centered-1BZ canonicalization for plotting/representatives
+      2. optional FS projection of kept patch reps
+    """
+    K_full = exact_M_hex_loop_points(model, points_per_edge=points_per_edge, edge_cluster_alpha=edge_cluster_alpha,)
+    return _build_patchset_from_loop(
+        model,
+        K_full,
+        orbital_slice,
+        band_index,
+        points_per_edge=points_per_edge,
+        remove_duplicate_M_modG=remove_duplicate_M_modG,
+        keep_strict_M_anchors=keep_strict_M_anchors,
+        gauge_fix=gauge_fix,
+        close_loop_gauge=close_loop_gauge,
+        gauge_anchor=gauge_anchor,
+        project_to_fs_points=project_to_fs_points,
+        mu=mu,
+        fd_step=fd_step,
+        builder_name="manual_exact_M_hex",
+    )
 
-            if len(contours) == 0:
-                continue
 
-            for c in contours:
-                c_ref = self.refine_contour_to_true_fs(c, mu)
-                anchors = (
-                    self.detect_stationary_anchors_on_contour(c_ref, mu)
-                    if self.anchor_stationary_points
-                    else np.zeros((0, 2), dtype=float)
-                )
-                key = self._contour_score_with_anchors(c_ref, anchors)
+def build_exactM_patchset_global_angular(
+    model,
+    orbital_slice,
+    band_index,
+    *,
+    points_per_edge=1,
+    remove_duplicate_M_modG=False,
+    keep_strict_M_anchors=True,
+    gauge_fix=True,
+    close_loop_gauge=True,
+    gauge_anchor="max_component",
+    project_to_fs_points=True,
+    mu=0.0,
+    fd_step=1e-5,
+):
+    K_full = exact_M_hex_loop_points_global_angular(
+        model,
+        points_per_edge=points_per_edge,
+    )
+    return _build_patchset_from_loop(
+        model,
+        K_full,
+        orbital_slice,
+        band_index,
+        points_per_edge=points_per_edge,
+        remove_duplicate_M_modG=remove_duplicate_M_modG,
+        keep_strict_M_anchors=keep_strict_M_anchors,
+        gauge_fix=gauge_fix,
+        close_loop_gauge=close_loop_gauge,
+        gauge_anchor=gauge_anchor,
+        project_to_fs_points=project_to_fs_points,
+        mu=mu,
+        fd_step=fd_step,
+        builder_name="manual_exact_M_hex_globalAngular",
+    )
 
-                if self.verbose:
-                    print(f"[FSPatcher]   key={key} at mu_level={mu_level:.12g}")
 
-                if best is None or key > best[0]:
-                    best = (key, c_ref, mu_level)
-                    best_anchors = anchors
-
-        if best is None:
-            raise RuntimeError("No valid FS contour found for any tested contour level.")
-
-        return best[1], best[2], best_anchors
-
-    # ------------------------
-    # contour resampling
-    # ------------------------
-    def resample_contour_by_arclength(self, contour: np.ndarray, Npatch: int):
-        contour = self.close_contour_if_needed(contour)
-        diffs = np.diff(contour, axis=0)
-        seglen = np.linalg.norm(diffs, axis=1)
-        s = np.concatenate([[0.0], np.cumsum(seglen)])
-        total = s[-1]
-        if total <= 0:
-            raise RuntimeError("Contour length is zero.")
-
-        targets = np.linspace(0.0, total, Npatch, endpoint=False)
-        reps = []
-
-        for t in targets:
-            idx = np.searchsorted(s, t, side="right") - 1
-            idx = min(max(idx, 0), len(seglen) - 1)
-
-            ds = seglen[idx]
-            if ds < 1e-14:
-                reps.append(contour[idx].copy())
-                continue
-
-            alpha = (t - s[idx]) / ds
-            reps.append((1.0 - alpha) * contour[idx] + alpha * contour[idx + 1])
-
-        return reps
-
-    def resample_contour_with_anchors(self, contour: np.ndarray, anchors: np.ndarray, Npatch: int):
-        contour = self.close_contour_if_needed(np.asarray(contour, dtype=float))
-        anchors = np.asarray(anchors, dtype=float)
-
-        if anchors.shape[0] == 0:
-            return self.resample_contour_by_arclength(contour, Npatch)
-
-        if anchors.shape[0] > Npatch:
-            raise ValueError(f"Found {anchors.shape[0]} anchors, but Npatch={Npatch} is smaller.")
-
-        if anchors.shape[0] == Npatch:
-            return [a.copy() for a in anchors]
-
-        diffs = np.diff(contour, axis=0)
-        seglen = np.linalg.norm(diffs, axis=1)
-        s = np.concatenate([[0.0], np.cumsum(seglen)])
-        total = s[-1]
-
-        def nearest_s_of_point(k):
-            d = np.linalg.norm(contour[:-1] - k[None, :], axis=1)
-            j = int(np.argmin(d))
-            return s[j]
-
-        anchor_s = np.array([nearest_s_of_point(a) for a in anchors], dtype=float)
-        order = np.argsort(anchor_s)
-        anchor_s = anchor_s[order]
-        anchors = anchors[order]
-
-        n_extra = Npatch - len(anchors)
-        if n_extra == 0:
-            return [a.copy() for a in anchors]
-
-        seg_lengths = []
-        for i in range(len(anchor_s)):
-            s0 = anchor_s[i]
-            s1 = anchor_s[(i + 1) % len(anchor_s)]
-            ds = s1 - s0 if s1 > s0 else (total - s0 + s1)
-            seg_lengths.append(ds)
-        seg_lengths = np.array(seg_lengths, dtype=float)
-
-        raw_counts = n_extra * seg_lengths / np.sum(seg_lengths)
-        extra_counts = np.floor(raw_counts).astype(int)
-        remain = n_extra - np.sum(extra_counts)
-
-        if remain > 0:
-            frac = raw_counts - extra_counts
-            add_order = np.argsort(-frac)
-            for j in add_order[:remain]:
-                extra_counts[j] += 1
-
-        def interp_at_s(t):
-            if t < 0:
-                t += total
-            if t >= total:
-                t -= total
-            idx = np.searchsorted(s, t, side="right") - 1
-            idx = min(max(idx, 0), len(seglen) - 1)
-            ds = seglen[idx]
-            if ds < 1e-14:
-                return contour[idx].copy()
-            alpha = (t - s[idx]) / ds
-            return (1.0 - alpha) * contour[idx] + alpha * contour[idx + 1]
-
-        extra_pts = []
-        for i in range(len(anchor_s)):
-            c = int(extra_counts[i])
-            if c <= 0:
-                continue
-            s0 = anchor_s[i]
-            s1 = anchor_s[(i + 1) % len(anchor_s)]
-            ds = s1 - s0 if s1 > s0 else (total - s0 + s1)
-            for m in range(1, c + 1):
-                extra_pts.append(interp_at_s(s0 + ds * m / (c + 1)))
-
-        all_pts = np.vstack([anchors, np.asarray(extra_pts, dtype=float)]) if len(extra_pts) else anchors.copy()
-        center = np.mean(all_pts, axis=0)
-        ang = np.arctan2(all_pts[:, 1] - center[1], all_pts[:, 0] - center[0])
-        return [all_pts[i].copy() for i in np.argsort(ang)]
-
-    # ------------------------
-    # main
-    # ------------------------
-    def build(self) -> PatchSet:
-        mu = self.get_mu()
-        filling = self.filling if self.filling is not None else np.nan
-
-        KX, KY, E, verts = self.build_energy_grid_periodized()
-
-        if self.strict_mu_contour:
-            try:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_exact_mu(KX, KY, E, mu)
-            except RuntimeError:
-                if not self.allow_level_shift_fallback:
-                    raise
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_over_shifts(KX, KY, E, mu)
-        else:
-            if self.allow_level_shift_fallback:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_over_shifts(KX, KY, E, mu)
-            else:
-                main_contour, mu_used_for_contour, anchors = self.choose_best_contour_exact_mu(KX, KY, E, mu)
-
-        main_contour = self.refine_contour_to_true_fs(main_contour, mu)
-
-        if self.anchor_stationary_points and anchors is None:
-            anchors = self.detect_stationary_anchors_on_contour(main_contour, mu)
-        elif anchors is None:
-            anchors = np.zeros((0, 2), dtype=float)
-
-        reps = self.resample_contour_with_anchors(main_contour, anchors, self.Npatch)
-
-        patches = []
-        raw_eigvecs = []
-        for pid, k0 in enumerate(reps):
-            kf = self.project_to_fs(k0, mu)
-            uv = self.wrap_red(self.cart_to_red(kf))
-            e = self.band_energy(kf[0], kf[1])
-            vf = self.fermi_velocity(kf[0], kf[1])
-            eig = self._normalize_eigvec(self.band_eigvec(kf[0], kf[1]))
-            raw_eigvecs.append(eig)
-
-            patches.append(
-                PatchPoint(
-                    patch_id=pid,
-                    k_cart=np.asarray(kf, dtype=float),
-                    k_red=uv,
-                    energy=float(e),
-                    vF=np.asarray(vf, dtype=float),
-                    vF_norm=float(np.linalg.norm(vf)),
-                    eigvec=eig,
-                    orbital_weight=self.orbital_weight(eig),
-                )
-            )
-
-        gauge_method = None
-        gauge_loop_phase = 0.0
-        if self.gauge_fix == "parallel_transport" and len(patches) > 0:
-            fixed, gauge_loop_phase = self.smooth_patch_eigvecs(np.array(raw_eigvecs, dtype=complex))
-            for pid, u in enumerate(fixed):
-                patches[pid] = replace(
-                    patches[pid],
-                    eigvec=u,
-                    orbital_weight=self.orbital_weight(u),
-                )
-            gauge_method = "parallel_transport"
-
-        return PatchSet(
-            mu=mu,
-            mu_used_for_contour=mu_used_for_contour,
-            band_index=self.band_index,
-            filling=filling,
-            patches=patches,
-            fs_contour_k=main_contour,
-            bz_vertices=verts,
-            b1=self.b1,
-            b2=self.b2,
-            gauge_method=gauge_method,
-            gauge_loop_phase=gauge_loop_phase,
-        )
+# =============================================================================
+# Plotting
+# =============================================================================
 
 
 def plot_patchset(patchset, ax=None, show_contour=True, show_velocity=False, show_bz=True):
     import matplotlib.pyplot as plt
 
     if ax is None:
-        fig, ax = plt.subplots(figsize=(6, 6))
+        _, ax = plt.subplots(figsize=(6, 6))
 
     if show_bz and patchset.bz_vertices is not None:
         bz = np.vstack([patchset.bz_vertices, patchset.bz_vertices[0]])
         ax.plot(bz[:, 0], bz[:, 1], color="black", lw=1.2, alpha=0.8, label="1st BZ")
 
     if show_contour and patchset.fs_contour_k is not None:
-        kk = patchset.fs_contour_k
+        kk = np.asarray(patchset.fs_contour_k, dtype=float)
         kk2 = np.vstack([kk, kk[0]])
-        ax.plot(kk2[:, 0], kk2[:, 1], lw=1.3, alpha=0.85, label="FS contour")
+        ax.plot(kk2[:, 0], kk2[:, 1], lw=1.3, alpha=0.85, label="manual M-loop")
 
     pk = patchset.patch_k
-    ax.scatter(pk[:, 0], pk[:, 1], s=24, label="patch reps", zorder=3)
+    ax.scatter(pk[:, 0], pk[:, 1], s=28, label="patch reps", zorder=3)
 
     for p in patchset.patches:
         ax.text(p.k_cart[0], p.k_cart[1], str(p.patch_id), fontsize=7)
@@ -839,8 +925,13 @@ def plot_patchset(patchset, ax=None, show_contour=True, show_velocity=False, sho
     if show_velocity:
         v = patchset.patch_vF
         ax.quiver(
-            pk[:, 0], pk[:, 1], v[:, 0], v[:, 1],
-            angles="xy", scale_units="xy", scale=1.0
+            pk[:, 0],
+            pk[:, 1],
+            v[:, 0],
+            v[:, 1],
+            angles="xy",
+            scale_units="xy",
+            scale=1.0,
         )
 
     ax.set_aspect("equal")

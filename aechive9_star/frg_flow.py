@@ -137,9 +137,6 @@ class FRGFlowSolverSZ0:
         diagnosis_Qs: Optional[Sequence[Sequence[float]]] = None,
         diagnosis_score_threshold: Optional[float] = None,
         diagnosis_landau_F: bool = False,
-        patch_measure_mode: str = "unit",
-        patch_measure_soft_vf_eps: Optional[float] = None,
-        patch_measure_normalize_mean: bool = False,
         closure_tol: Optional[float] = None,
         drop_inexact_closure: bool = False,
     ) -> None:
@@ -191,9 +188,6 @@ class FRGFlowSolverSZ0:
         ]
         self.diagnosis_score_threshold = None if diagnosis_score_threshold is None else float(diagnosis_score_threshold)
         self.diagnosis_landau_F = bool(diagnosis_landau_F)
-        self.patch_measure_mode = str(patch_measure_mode)
-        self.patch_measure_soft_vf_eps = None if patch_measure_soft_vf_eps is None else float(patch_measure_soft_vf_eps)
-        self.patch_measure_normalize_mean = bool(patch_measure_normalize_mean)
 
         self._spins = ("up", "dn")
         self._validate_patch_counts()
@@ -330,9 +324,6 @@ class FRGFlowSolverSZ0:
                 self.patchsets,
                 self._flow_config(self.T_start),
                 shift_cache={("up", "dn"): self._partner_map_pp_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)},
-                patch_measure_mode=self.patch_measure_mode,
-                patch_measure_soft_vf_eps=self.patch_measure_soft_vf_eps,
-                patch_measure_normalize_mean=self.patch_measure_normalize_mean,
             )[("up", "dn")]
             self._pp_qminus[iq] = {
                 "partner": np.asarray(legacy["partner"], dtype=int),
@@ -421,9 +412,6 @@ class FRGFlowSolverSZ0:
                 self.patchsets,
                 cfg,
                 shift_cache={("up", "dn"): self._partner_map_pp_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)},
-                patch_measure_mode=self.patch_measure_mode,
-                patch_measure_soft_vf_eps=self.patch_measure_soft_vf_eps,
-                patch_measure_normalize_mean=self.patch_measure_normalize_mean,
             )[("up", "dn")]
             pp_internal_by_iq[iq] = {
                 "partner": np.asarray(legacy["partner"], dtype=int),
@@ -435,10 +423,7 @@ class FRGFlowSolverSZ0:
             legacy = build_ph_internal_cache_vec(
                 self.patchsets,
                 cfg,
-                shift_cache={("up", "dn"): (template["partner"], template["residual"])},
-                patch_measure_mode=self.patch_measure_mode,
-                patch_measure_soft_vf_eps=self.patch_measure_soft_vf_eps,
-                patch_measure_normalize_mean=self.patch_measure_normalize_mean,
+                shift_cache={("up", "dn"): (template["partner"], template["residual"])}
             )[("up", "dn")]
             ph_internal_by_iq[iq] = {
                 "partner": template["partner"],
@@ -450,10 +435,7 @@ class FRGFlowSolverSZ0:
             legacy = build_ph_internal_cache_vec(
                 self.patchsets,
                 cfg,
-                shift_cache={("up", "dn"): (template["partner"], template["residual"])},
-                patch_measure_mode=self.patch_measure_mode,
-                patch_measure_soft_vf_eps=self.patch_measure_soft_vf_eps,
-                patch_measure_normalize_mean=self.patch_measure_normalize_mean,
+                shift_cache={("up", "dn"): (template["partner"], template["residual"])}
             )[("up", "dn")]
             phc_internal_by_iq[iq] = {
                 "partner": template["partner"],
@@ -713,9 +695,6 @@ class FRGFlowSolverSZ0:
             "phd_q_index_plus": {k: v.copy() for k, v in self._phd_q_index_plus.items()},
             "phc_q_index_plus": {k: v.copy() for k, v in self._phc_q_index_plus.items()},
             "phc_q_index_minus": {k: v.copy() for k, v in self._phc_q_index_minus.items()},
-            "patch_measure_mode": self.patch_measure_mode,
-            "patch_measure_soft_vf_eps": self.patch_measure_soft_vf_eps,
-            "patch_measure_normalize_mean": self.patch_measure_normalize_mean,
         }
 
 

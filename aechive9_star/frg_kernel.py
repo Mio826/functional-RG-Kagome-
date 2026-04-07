@@ -384,67 +384,6 @@ def _patch_energies(ps) -> np.ndarray:
     return np.array([float(p.energy) for p in ps.patches], dtype=float)
 
 
-def _safe_patch_array(ps, attr: str, fallback: float = 1.0) -> np.ndarray:
-    if hasattr(ps, attr):
-        arr = np.asarray(getattr(ps, attr), dtype=float)
-        if arr.shape == (getattr(ps, "Npatch", len(getattr(ps, "patches", []))),):
-            return arr
-    return np.full(getattr(ps, "Npatch", len(getattr(ps, "patches", []))), float(fallback), dtype=float)
-
-
-def patch_measure_vector(
-    ps,
-    *,
-    mode: str = "unit",
-    soft_vf_eps: Optional[float] = None,
-    normalize_mean: bool = False,
-) -> np.ndarray:
-    """
-    Patch-space measure used to dress one-loop bubble weights.
-
-    Supported modes
-    ---------------
-    - 'unit'               : omega_p = 1
-    - 'length'             : omega_p = ell_p
-    - 'length_over_vf'     : omega_p = ell_p / max(|vF_p|, eps_floor)
-    - 'length_over_vf_soft': omega_p = ell_p / sqrt(|vF_p|^2 + eps^2)
-
-    Notes
-    -----
-    This function only constructs the geometric weight vector. The actual
-    one-loop cache weight is omega_p * bubble_p.
-    """
-    mode = str(mode).lower()
-    n = int(getattr(ps, "Npatch", len(getattr(ps, "patches", []))))
-    ell = _safe_patch_array(ps, "patch_weight_length", fallback=1.0)
-    vf = _safe_patch_array(ps, "patch_vF_norm", fallback=1.0)
-
-    if mode == "unit":
-        omega = np.ones(n, dtype=float)
-    elif mode == "length":
-        omega = np.asarray(ell, dtype=float)
-    elif mode == "length_over_vf":
-        eps_floor = 1e-14 if soft_vf_eps is None else float(abs(soft_vf_eps))
-        omega = np.asarray(ell, dtype=float) / np.maximum(np.asarray(vf, dtype=float), eps_floor)
-    elif mode == "length_over_vf_soft":
-        eps = 1e-8 if soft_vf_eps is None else float(abs(soft_vf_eps))
-        omega = np.asarray(ell, dtype=float) / np.sqrt(np.asarray(vf, dtype=float) ** 2 + eps ** 2)
-    else:
-        raise ValueError(
-            "patch measure mode must be one of {'unit', 'length', 'length_over_vf', 'length_over_vf_soft'}"
-        )
-
-    omega = np.asarray(omega, dtype=float)
-    omega[~np.isfinite(omega)] = 0.0
-
-    if normalize_mean:
-        pos = omega[np.isfinite(omega) & (omega > 0)]
-        if pos.size > 0:
-            omega = omega / float(np.mean(pos))
-
-    return omega
-
-
 def _bubble_dot_pp_vec(Ea: np.ndarray, Eb: np.ndarray, config: FlowConfig) -> np.ndarray:
     T = float(config.temperature)
     _, w, dw_dT = _matsubara_grid_cached(T, int(config.nfreq))
@@ -493,9 +432,6 @@ def build_pp_internal_cache_vec(
     config: FlowConfig,
     *,
     shift_cache: Mapping[Tuple[str, str], ShiftMap],
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> Dict[Tuple[str, str], Dict[str, np.ndarray]]:
     cache: Dict[Tuple[str, str], Dict[str, np.ndarray]] = {}
     for (sa, sb), raw_shift in shift_cache.items():
@@ -503,18 +439,11 @@ def build_pp_internal_cache_vec(
         psb = patchset_for_spin(patchsets, sb)
         eps_a = _patch_energies(psa)
         eps_b_all = _patch_energies(psb)
-        measure_a = patch_measure_vector(
-            psa,
-            mode=patch_measure_mode,
-            soft_vf_eps=patch_measure_soft_vf_eps,
-            normalize_mean=patch_measure_normalize_mean,
-        )
         partner, residual = _coerce_shift_map(raw_shift)
         weights = np.zeros_like(eps_a, dtype=complex)
         valid = partner >= 0
         if np.any(valid):
-            bubble_vals = _bubble_dot_pp_vec(eps_a[valid], eps_b_all[partner[valid]], config)
-            weights[valid] = np.asarray(measure_a[valid], dtype=float) * bubble_vals
+            weights[valid] = _bubble_dot_pp_vec(eps_a[valid], eps_b_all[partner[valid]], config)
         cache[(sa, sb)] = {
             "partner": partner,
             "residual": residual,
@@ -528,9 +457,6 @@ def build_ph_internal_cache_vec(
     config: FlowConfig,
     *,
     shift_cache: Mapping[Tuple[str, str], ShiftMap],
-    patch_measure_mode: str = "unit",
-    patch_measure_soft_vf_eps: Optional[float] = None,
-    patch_measure_normalize_mean: bool = False,
 ) -> Dict[Tuple[str, str], Dict[str, np.ndarray]]:
     cache: Dict[Tuple[str, str], Dict[str, np.ndarray]] = {}
     for (sa, sb), raw_shift in shift_cache.items():
@@ -538,18 +464,11 @@ def build_ph_internal_cache_vec(
         psb = patchset_for_spin(patchsets, sb)
         eps_a = _patch_energies(psa)
         eps_b_all = _patch_energies(psb)
-        measure_a = patch_measure_vector(
-            psa,
-            mode=patch_measure_mode,
-            soft_vf_eps=patch_measure_soft_vf_eps,
-            normalize_mean=patch_measure_normalize_mean,
-        )
         partner, residual = _coerce_shift_map(raw_shift)
         weights = np.zeros_like(eps_a, dtype=complex)
         valid = partner >= 0
         if np.any(valid):
-            bubble_vals = _bubble_dot_ph_vec(eps_a[valid], eps_b_all[partner[valid]], config)
-            weights[valid] = np.asarray(measure_a[valid], dtype=float) * bubble_vals
+            weights[valid] = _bubble_dot_ph_vec(eps_a[valid], eps_b_all[partner[valid]], config)
         cache[(sa, sb)] = {
             "partner": partner,
             "residual": residual,
@@ -785,6 +704,5 @@ __all__ = [
     "has_patchset",
     "normalize_spin",
     "partner_map_from_q_index",
-    "patch_measure_vector",
     "patchset_for_spin",
 ]
