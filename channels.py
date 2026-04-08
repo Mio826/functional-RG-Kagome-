@@ -193,6 +193,32 @@ class SZ0ChannelBuilder:
             mode="k_plus_Q",
         )
 
+    def _ph_partner_same_momentum(self, iq: int, *, source_spin: str, target_spin: str, Q: Sequence[float]):
+        """
+        Partner map for k -> k+Q when the momentum leg stays in the same spin
+        sector on input/output.
+
+        In the current solver the Q-grid itself is spin-independent; this helper
+        prefers the exact (source_spin, target_spin) routing table when present
+        and falls back to the opposite-spin table only if that exact key is not
+        available. The fallback is numerically harmless when up/dn patchsets are
+        identical, but using the same-spin key is the formally correct choice for
+        legs such as p4 in ph_exchange.
+        """
+        key = (source_spin, target_spin)
+        q_index = self._phd_q_index_plus.get(key)
+        if q_index is None:
+            q_index = self._phd_q_index_plus[(source_spin, "dn" if target_spin == "up" else "up")]
+        return partner_map_from_q_index(
+            self.patchsets,
+            q_index,
+            source_spin=source_spin,
+            target_spin=target_spin,
+            iq_target=int(iq),
+            Q=canonicalize_q_for_patchsets(self.patchsets, Q),
+            mode="k_plus_Q",
+        )
+
     def _pp_raw_v(self, Q: Sequence[float]) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         iq = self.pp_grid.nearest_index(Q)
@@ -309,22 +335,48 @@ class SZ0ChannelBuilder:
         )
 
     def ph_exchange(self, Q: Sequence[float]) -> ChannelKernel:
+        """
+        Raw crossed particle-hole kernel
+
+            V_x(k', k; Q) = V(k, k'+Q; k', k+Q),
+
+        in the minimal object convention
+            V(p1, p2; p3, p4) = Γ_{up,dn -> dn,up}(p1, p2; p3, p4).
+
+        Therefore:
+          p1 = k        (up)
+          p2 = k'+Q     (dn)
+          p3 = k'       (dn)
+          p4 = k+Q      (up)
+
+        The subtle point is that p4 lives in the *up* sector, so its partner map
+        should formally be the same-spin up->up k+Q map, not the opposite-spin
+        up->dn map. When up/dn patchsets are identical these indices coincide
+        numerically, but using the same-spin route keeps the construction
+        semantically correct and avoids latent issues if the spin-resolved
+        patchsets ever diverge.
+        """
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         iq = self.phd_grid.nearest_index(Q)
-        kplus_in, resid_in = self._ph_partner(iq, first_spin="up", second_spin="dn", Q=Q)
-        kplus_out, resid_out = self._ph_partner(iq, first_spin="up", second_spin="dn", Q=Q)
+
+        # p2 = k'+Q in the dn sector
+        kplus_out_dn, resid_out_dn = self._ph_partner(iq, first_spin="up", second_spin="dn", Q=Q)
+        # p4 = k+Q in the up sector (formally same-spin routing)
+        kplus_in_up, resid_in_up = self._ph_partner_same_momentum(
+            iq, source_spin="up", target_spin="up", Q=Q
+        )
 
         M = np.zeros((self.Npatch, self.Npatch), dtype=complex)
         residuals = np.zeros((self.Npatch, self.Npatch), dtype=float)
         for pout in range(self.Npatch):
-            p2 = int(kplus_out[pout])
+            p2 = int(kplus_out_dn[pout])
             p3 = pout
             for pin in range(self.Npatch):
-                p4 = int(kplus_in[pin])
+                p4 = int(kplus_in_up[pin])
                 if p2 >= 0 and p4 >= 0:
                     residual_here = max(
-                        float(resid_in[pin]),
-                        float(resid_out[pout]),
+                        float(resid_in_up[pin]),
+                        float(resid_out_dn[pout]),
                         self._stored_p4_residual(pin, p2, p3),
                     )
                     residuals[pout, pin] = residual_here
@@ -334,15 +386,15 @@ class SZ0ChannelBuilder:
                     if int(p4_expected) == int(p4):
                         M[pout, pin] = self.vertex(pin, p2, p3, p4)
                 else:
-                    residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
+                    residuals[pout, pin] = max(float(resid_in_up[pin]), float(resid_out_dn[pout]))
         return ChannelKernel(
             name="ph_exchange",
             Q=np.asarray(Q, dtype=float),
             matrix=M,
             row_patches=np.arange(self.Npatch, dtype=int),
             col_patches=np.arange(self.Npatch, dtype=int),
-            row_partner_patches=np.asarray(kplus_out, dtype=int),
-            col_partner_patches=np.asarray(kplus_in, dtype=int),
+            row_partner_patches=np.asarray(kplus_out_dn, dtype=int),
+            col_partner_patches=np.asarray(kplus_in_up, dtype=int),
             residuals=residuals,
         )
 
