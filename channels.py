@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -20,8 +20,51 @@ SpinLike = Union[str, int]
 
 
 @dataclass
+class DegenerateSubspace:
+    """A near-degenerate eigenspace of one kernel."""
+
+    indices: np.ndarray
+    evals: np.ndarray
+    basis_vectors: np.ndarray
+    dimension: int
+    spread_abs: float
+    spread_rel: float
+
+    def summary_dict(self) -> Dict[str, object]:
+        return {
+            "indices": [int(x) for x in np.asarray(self.indices, dtype=int)],
+            "evals": np.asarray(self.evals).tolist(),
+            "dimension": int(self.dimension),
+            "spread_abs": float(self.spread_abs),
+            "spread_rel": float(self.spread_rel),
+        }
+
+
+@dataclass
+class KernelSpectrumSummary:
+    """Hermitian-spectrum summary for one channel kernel."""
+
+    evals: np.ndarray
+    evecs: np.ndarray
+    sort_by: str
+    top_n: int
+    top_evals: np.ndarray
+    top_evecs: np.ndarray
+    degenerate_groups: List[DegenerateSubspace]
+
+    def summary_dict(self) -> Dict[str, object]:
+        return {
+            "sort_by": self.sort_by,
+            "top_n": int(self.top_n),
+            "top_evals": np.asarray(self.top_evals).tolist(),
+            "degenerate_groups": [grp.summary_dict() for grp in self.degenerate_groups],
+        }
+
+
+@dataclass
 class ChannelKernel:
     """Patch-space kernel for one physical channel at fixed Q."""
+
     name: str
     Q: np.ndarray
     matrix: np.ndarray
@@ -30,6 +73,11 @@ class ChannelKernel:
     row_partner_patches: np.ndarray
     col_partner_patches: np.ndarray
     residuals: np.ndarray
+    channel_type: str = "unknown"
+    spin_structure: str = "unknown"
+    order_family: str = "unknown"
+    landau_projected: bool = False
+    raw_components: Tuple[str, ...] = ()
 
     @property
     def Npatch(self) -> int:
@@ -38,6 +86,10 @@ class ChannelKernel:
     def hermitian_residual(self) -> float:
         return float(np.max(np.abs(self.matrix - self.matrix.conjugate().T)))
 
+    def hermitian_matrix(self) -> np.ndarray:
+        M = np.asarray(self.matrix, dtype=complex)
+        return 0.5 * (M + M.conjugate().T)
+
     def eig(self, sort_by: str = "abs"):
         vals, vecs = np.linalg.eig(self.matrix)
         if sort_by == "abs":
@@ -45,11 +97,110 @@ class ChannelKernel:
         elif sort_by == "real":
             order = np.argsort(-np.real(vals))
         elif sort_by == "hermitian":
-            vals, vecs = np.linalg.eigh(0.5 * (self.matrix + self.matrix.conjugate().T))
+            vals, vecs = np.linalg.eigh(self.hermitian_matrix())
             order = np.argsort(-vals)
         else:
             raise ValueError("sort_by must be 'abs', 'real', or 'hermitian'.")
         return vals[order], vecs[:, order]
+
+    def hermitian_eig(self):
+        vals, vecs = np.linalg.eigh(self.hermitian_matrix())
+        order = np.argsort(-vals)
+        return vals[order], vecs[:, order]
+
+    def leading_modes(self, n: int = 4, *, hermitian: bool = True):
+        n = max(1, min(int(n), self.Npatch))
+        vals, vecs = self.hermitian_eig() if hermitian else self.eig(sort_by="abs")
+        return vals[:n], vecs[:, :n]
+
+    def find_near_degenerate_groups(
+        self,
+        *,
+        top_n: int = 6,
+        atol: float = 1e-8,
+        rtol: float = 1e-5,
+        hermitian: bool = True,
+    ) -> List[DegenerateSubspace]:
+        vals, vecs = self.hermitian_eig() if hermitian else self.eig(sort_by="abs")
+        if vals.size == 0:
+            return []
+
+        n = max(1, min(int(top_n), vals.size))
+        vals = vals[:n]
+        vecs = vecs[:, :n]
+
+        groups: List[DegenerateSubspace] = []
+        start = 0
+        while start < n:
+            stop = start + 1
+            ref = vals[start]
+            while stop < n:
+                diff = abs(vals[stop] - ref)
+                scale = max(abs(ref), abs(vals[stop]), 1.0)
+                if diff <= atol + rtol * scale:
+                    stop += 1
+                else:
+                    break
+            if stop - start >= 2:
+                block_vals = vals[start:stop]
+                spread_abs = float(np.max(block_vals) - np.min(block_vals))
+                denom = max(float(np.max(np.abs(block_vals))), 1.0)
+                spread_rel = float(spread_abs / denom)
+                groups.append(
+                    DegenerateSubspace(
+                        indices=np.arange(start, stop, dtype=int),
+                        evals=np.asarray(block_vals).copy(),
+                        basis_vectors=np.asarray(vecs[:, start:stop]).copy(),
+                        dimension=int(stop - start),
+                        spread_abs=spread_abs,
+                        spread_rel=spread_rel,
+                    )
+                )
+            start = stop
+        return groups
+
+    def spectrum_summary(
+        self,
+        *,
+        top_n: int = 6,
+        atol: float = 1e-8,
+        rtol: float = 1e-5,
+        hermitian: bool = True,
+    ) -> KernelSpectrumSummary:
+        vals, vecs = self.hermitian_eig() if hermitian else self.eig(sort_by="abs")
+        n = max(1, min(int(top_n), vals.size))
+        groups = self.find_near_degenerate_groups(top_n=n, atol=atol, rtol=rtol, hermitian=hermitian)
+        return KernelSpectrumSummary(
+            evals=np.asarray(vals).copy(),
+            evecs=np.asarray(vecs).copy(),
+            sort_by="hermitian" if hermitian else "abs",
+            top_n=n,
+            top_evals=np.asarray(vals[:n]).copy(),
+            top_evecs=np.asarray(vecs[:, :n]).copy(),
+            degenerate_groups=groups,
+        )
+
+    def project_onto_basis(self, basis_vectors: np.ndarray, *, hermitian: bool = True) -> np.ndarray:
+        B = np.asarray(basis_vectors, dtype=complex)
+        if B.ndim == 1:
+            B = B[:, None]
+        if B.shape[0] != self.Npatch:
+            raise ValueError(f"basis_vectors first dimension must equal Npatch={self.Npatch}, got {B.shape[0]}")
+        M = self.hermitian_matrix() if hermitian else np.asarray(self.matrix, dtype=complex)
+        return B.conjugate().T @ M @ B
+
+    def summary_dict(self) -> Dict[str, object]:
+        return {
+            "name": self.name,
+            "Q": np.asarray(self.Q, dtype=float).tolist(),
+            "channel_type": self.channel_type,
+            "spin_structure": self.spin_structure,
+            "order_family": self.order_family,
+            "landau_projected": bool(self.landau_projected),
+            "Npatch": int(self.Npatch),
+            "hermitian_residual": float(self.hermitian_residual()),
+            "residual_absmax": float(np.max(np.abs(self.residuals))) if self.residuals.size else 0.0,
+        }
 
 
 class SZ0ChannelBuilder:
@@ -194,17 +345,6 @@ class SZ0ChannelBuilder:
         )
 
     def _ph_partner_same_momentum(self, iq: int, *, source_spin: str, target_spin: str, Q: Sequence[float]):
-        """
-        Partner map for k -> k+Q when the momentum leg stays in the same spin
-        sector on input/output.
-
-        In the current solver the Q-grid itself is spin-independent; this helper
-        prefers the exact (source_spin, target_spin) routing table when present
-        and falls back to the opposite-spin table only if that exact key is not
-        available. The fallback is numerically harmless when up/dn patchsets are
-        identical, but using the same-spin key is the formally correct choice for
-        legs such as p4 in ph_exchange.
-        """
         key = (source_spin, target_spin)
         q_index = self._phd_q_index_plus.get(key)
         if q_index is None:
@@ -267,34 +407,71 @@ class SZ0ChannelBuilder:
                         M[pout, pin] = self.vertex(pin, p2, p3, p4)
         return M
 
+    def _make_kernel(
+        self,
+        *,
+        name: str,
+        Q: Sequence[float],
+        matrix: np.ndarray,
+        row_partner_patches: np.ndarray,
+        col_partner_patches: np.ndarray,
+        residuals: np.ndarray,
+        channel_type: str,
+        spin_structure: str,
+        order_family: str,
+        landau_projected: bool,
+        raw_components: Tuple[str, ...],
+    ) -> ChannelKernel:
+        return ChannelKernel(
+            name=name,
+            Q=np.asarray(Q, dtype=float),
+            matrix=np.asarray(matrix, dtype=complex),
+            row_patches=np.arange(self.Npatch, dtype=int),
+            col_patches=np.arange(self.Npatch, dtype=int),
+            row_partner_patches=np.asarray(row_partner_patches, dtype=int),
+            col_partner_patches=np.asarray(col_partner_patches, dtype=int),
+            residuals=np.asarray(residuals, dtype=float),
+            channel_type=channel_type,
+            spin_structure=spin_structure,
+            order_family=order_family,
+            landau_projected=landau_projected,
+            raw_components=raw_components,
+        )
+
     def pp_singlet(self, Q: Sequence[float]) -> ChannelKernel:
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         Vraw, partner_in, residuals = self._pp_raw_v(Q)
         Vex = self._pp_out_exchange_v(Q)
-        return ChannelKernel(
+        return self._make_kernel(
             name="pp_singlet",
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=Vraw + Vex,
-            row_patches=np.arange(self.Npatch, dtype=int),
-            col_patches=np.arange(self.Npatch, dtype=int),
-            row_partner_patches=np.asarray(partner_in, dtype=int),
-            col_partner_patches=np.asarray(partner_in, dtype=int),
+            row_partner_patches=partner_in,
+            col_partner_patches=partner_in,
             residuals=residuals,
+            channel_type="pp",
+            spin_structure="singlet",
+            order_family="pairing",
+            landau_projected=False,
+            raw_components=("pp_raw", "pp_out_exchange"),
         )
 
     def pp_triplet(self, Q: Sequence[float]) -> ChannelKernel:
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         Vraw, partner_in, residuals = self._pp_raw_v(Q)
         Vex = self._pp_out_exchange_v(Q)
-        return ChannelKernel(
+        return self._make_kernel(
             name="pp_triplet",
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=Vraw - Vex,
-            row_patches=np.arange(self.Npatch, dtype=int),
-            col_patches=np.arange(self.Npatch, dtype=int),
-            row_partner_patches=np.asarray(partner_in, dtype=int),
-            col_partner_patches=np.asarray(partner_in, dtype=int),
+            row_partner_patches=partner_in,
+            col_partner_patches=partner_in,
             residuals=residuals,
+            channel_type="pp",
+            spin_structure="triplet",
+            order_family="pairing",
+            landau_projected=False,
+            raw_components=("pp_raw", "pp_out_exchange"),
         )
 
     def ph_direct(self, Q: Sequence[float]) -> ChannelKernel:
@@ -323,48 +500,25 @@ class SZ0ChannelBuilder:
                         M[pout, pin] = self.vertex(pin, p2, p3, pout)
                 else:
                     residuals[pout, pin] = max(float(resid_in[pin]), float(resid_out[pout]))
-        return ChannelKernel(
+        return self._make_kernel(
             name="ph_direct",
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=M,
-            row_patches=np.arange(self.Npatch, dtype=int),
-            col_patches=np.arange(self.Npatch, dtype=int),
-            row_partner_patches=np.asarray(kplus_out, dtype=int),
-            col_partner_patches=np.asarray(kplus_in, dtype=int),
+            row_partner_patches=kplus_out,
+            col_partner_patches=kplus_in,
             residuals=residuals,
+            channel_type="ph",
+            spin_structure="raw_direct",
+            order_family="ph_raw",
+            landau_projected=False,
+            raw_components=("ph_direct",),
         )
 
     def ph_exchange(self, Q: Sequence[float]) -> ChannelKernel:
-        """
-        Raw crossed particle-hole kernel
-
-            V_x(k', k; Q) = V(k, k'+Q; k', k+Q),
-
-        in the minimal object convention
-            V(p1, p2; p3, p4) = Γ_{up,dn -> dn,up}(p1, p2; p3, p4).
-
-        Therefore:
-          p1 = k        (up)
-          p2 = k'+Q     (dn)
-          p3 = k'       (dn)
-          p4 = k+Q      (up)
-
-        The subtle point is that p4 lives in the *up* sector, so its partner map
-        should formally be the same-spin up->up k+Q map, not the opposite-spin
-        up->dn map. When up/dn patchsets are identical these indices coincide
-        numerically, but using the same-spin route keeps the construction
-        semantically correct and avoids latent issues if the spin-resolved
-        patchsets ever diverge.
-        """
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         iq = self.phd_grid.nearest_index(Q)
-
-        # p2 = k'+Q in the dn sector
         kplus_out_dn, resid_out_dn = self._ph_partner(iq, first_spin="up", second_spin="dn", Q=Q)
-        # p4 = k+Q in the up sector (formally same-spin routing)
-        kplus_in_up, resid_in_up = self._ph_partner_same_momentum(
-            iq, source_spin="up", target_spin="up", Q=Q
-        )
+        kplus_in_up, resid_in_up = self._ph_partner_same_momentum(iq, source_spin="up", target_spin="up", Q=Q)
 
         M = np.zeros((self.Npatch, self.Npatch), dtype=complex)
         residuals = np.zeros((self.Npatch, self.Npatch), dtype=float)
@@ -387,15 +541,18 @@ class SZ0ChannelBuilder:
                         M[pout, pin] = self.vertex(pin, p2, p3, p4)
                 else:
                     residuals[pout, pin] = max(float(resid_in_up[pin]), float(resid_out_dn[pout]))
-        return ChannelKernel(
+        return self._make_kernel(
             name="ph_exchange",
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=M,
-            row_patches=np.arange(self.Npatch, dtype=int),
-            col_patches=np.arange(self.Npatch, dtype=int),
-            row_partner_patches=np.asarray(kplus_out_dn, dtype=int),
-            col_partner_patches=np.asarray(kplus_in_up, dtype=int),
+            row_partner_patches=kplus_out_dn,
+            col_partner_patches=kplus_in_up,
             residuals=residuals,
+            channel_type="ph",
+            spin_structure="raw_exchange",
+            order_family="ph_raw",
+            landau_projected=False,
+            raw_components=("ph_exchange",),
         )
 
     def ph_charge(self, Q: Sequence[float], *, Landau_F: Optional[bool] = None) -> ChannelKernel:
@@ -407,34 +564,42 @@ class SZ0ChannelBuilder:
         Vx = self.ph_exchange(Q)
         matrix = Vd.matrix - 2.0 * Vx.matrix
         name = "ph_charge"
+        projected = False
 
         if not Landau_F and self._is_q0(Q):
             matrix = self._project_out_uniform_mode(matrix)
             name = "ph_charge_q0_reduced"
+            projected = True
 
-        return ChannelKernel(
+        return self._make_kernel(
             name=name,
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=matrix,
-            row_patches=Vd.row_patches.copy(),
-            col_patches=Vd.col_patches.copy(),
             row_partner_patches=Vd.row_partner_patches.copy(),
             col_partner_patches=Vd.col_partner_patches.copy(),
             residuals=np.maximum(Vd.residuals, Vx.residuals),
+            channel_type="ph",
+            spin_structure="charge",
+            order_family="density_or_bond",
+            landau_projected=projected,
+            raw_components=("ph_direct", "ph_exchange"),
         )
 
     def ph_spin(self, Q: Sequence[float]) -> ChannelKernel:
         Q = canonicalize_q_for_patchsets(self.patchsets, Q)
         Vd = self.ph_direct(Q)
-        return ChannelKernel(
+        return self._make_kernel(
             name="ph_spin",
-            Q=np.asarray(Q, dtype=float),
+            Q=Q,
             matrix=Vd.matrix.copy(),
-            row_patches=Vd.row_patches.copy(),
-            col_patches=Vd.col_patches.copy(),
             row_partner_patches=Vd.row_partner_patches.copy(),
             col_partner_patches=Vd.col_partner_patches.copy(),
             residuals=Vd.residuals.copy(),
+            channel_type="ph",
+            spin_structure="spin",
+            order_family="density_or_bond",
+            landau_projected=False,
+            raw_components=("ph_direct",),
         )
 
     def build_kernel_dict(self, Q: Sequence[float], *, Landau_F: Optional[bool] = None) -> Dict[str, ChannelKernel]:
@@ -445,6 +610,46 @@ class SZ0ChannelBuilder:
             "ph_charge": self.ph_charge(Q, Landau_F=Landau_F),
             "ph_spin": self.ph_spin(Q),
         }
+
+    def build_kernel_spectrum_dict(
+        self,
+        Q: Sequence[float],
+        *,
+        Landau_F: Optional[bool] = None,
+        top_n: int = 6,
+        atol: float = 1e-8,
+        rtol: float = 1e-5,
+        hermitian: bool = True,
+    ) -> Dict[str, KernelSpectrumSummary]:
+        kernels = self.build_kernel_dict(Q, Landau_F=Landau_F)
+        return {
+            name: ker.spectrum_summary(top_n=top_n, atol=atol, rtol=rtol, hermitian=hermitian)
+            for name, ker in kernels.items()
+        }
+
+    def build_kernel_reports_for_Qs(
+        self,
+        Q_list: Sequence[Sequence[float]],
+        *,
+        Landau_F: Optional[bool] = None,
+        top_n: int = 6,
+        atol: float = 1e-8,
+        rtol: float = 1e-5,
+        hermitian: bool = True,
+    ) -> Dict[Tuple[float, float], Dict[str, KernelSpectrumSummary]]:
+        out: Dict[Tuple[float, float], Dict[str, KernelSpectrumSummary]] = {}
+        for Q in Q_list:
+            Q_can = canonicalize_q_for_patchsets(self.patchsets, Q)
+            q_key = tuple(np.asarray(Q_can, dtype=float).tolist())
+            out[q_key] = self.build_kernel_spectrum_dict(
+                Q_can,
+                Landau_F=Landau_F,
+                top_n=top_n,
+                atol=atol,
+                rtol=rtol,
+                hermitian=hermitian,
+            )
+        return out
 
     @classmethod
     def from_solver(
@@ -471,5 +676,7 @@ class SZ0ChannelBuilder:
 
 __all__ = [
     "ChannelKernel",
+    "DegenerateSubspace",
+    "KernelSpectrumSummary",
     "SZ0ChannelBuilder",
 ]

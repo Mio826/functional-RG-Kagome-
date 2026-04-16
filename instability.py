@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union
+from typing import Any, Dict, List, Mapping, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
@@ -17,6 +17,11 @@ from frg_kernel import (
     patch_measure_vector,
     patchset_for_spin,
 )
+
+
+# ---------------------------------------------------------------------------
+# Bubble data
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -37,6 +42,91 @@ class BubbleWeights:
         return int(self.weights.shape[0])
 
 
+# ---------------------------------------------------------------------------
+# Spectrum / multiplet / complex-order metadata
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class LeadingModeInfo:
+    score: float
+    eval: float
+    evec: np.ndarray
+    source: str
+    projection_name: Optional[str] = None
+
+
+@dataclass
+class MultipletCandidate:
+    channel_name: str
+    channel_type: str
+    spin_structure: str
+    Q: np.ndarray
+    source: str
+    indices: np.ndarray
+    evals: np.ndarray
+    basis_vectors: np.ndarray
+    dimension: int
+    spread_abs: float
+    spread_rel: float
+    eval_max_abs: float
+    degeneracy_type: str
+    physical_irrep_like: bool
+    notes: Tuple[str, ...] = ()
+
+    def summary_dict(self) -> Dict[str, Any]:
+        return {
+            "channel_name": self.channel_name,
+            "channel_type": self.channel_type,
+            "spin_structure": self.spin_structure,
+            "Q": np.asarray(self.Q, dtype=float).tolist(),
+            "source": self.source,
+            "indices": [int(i) for i in self.indices],
+            "evals": [float(x) for x in self.evals],
+            "dimension": int(self.dimension),
+            "spread_abs": float(self.spread_abs),
+            "spread_rel": float(self.spread_rel),
+            "eval_max_abs": float(self.eval_max_abs),
+            "degeneracy_type": self.degeneracy_type,
+            "physical_irrep_like": bool(self.physical_irrep_like),
+            "notes": list(self.notes),
+        }
+
+
+@dataclass
+class ComplexOrderCandidate:
+    parent_source: str
+    channel_name: str
+    channel_type: str
+    spin_structure: str
+    Q: np.ndarray
+    combo_type: str
+    basis_indices: Tuple[int, int]
+    vector_complex: np.ndarray
+    candidate_label: str
+    tr_breaking_possible: bool
+    notes: Tuple[str, ...] = ()
+
+    def summary_dict(self) -> Dict[str, Any]:
+        return {
+            "parent_source": self.parent_source,
+            "channel_name": self.channel_name,
+            "channel_type": self.channel_type,
+            "spin_structure": self.spin_structure,
+            "Q": np.asarray(self.Q, dtype=float).tolist(),
+            "combo_type": self.combo_type,
+            "basis_indices": [int(x) for x in self.basis_indices],
+            "candidate_label": self.candidate_label,
+            "tr_breaking_possible": bool(self.tr_breaking_possible),
+            "notes": list(self.notes),
+        }
+
+
+# ---------------------------------------------------------------------------
+# Config and result objects
+# ---------------------------------------------------------------------------
+
+
 @dataclass
 class InstabilityConfig:
     """Configuration for bubble-weighted instability diagnosis.
@@ -47,8 +137,6 @@ class InstabilityConfig:
     - ``pp_sign`` defaults to ``+1`` in the repaired pp diagnosis, together with
       ``abs`` bubble weights, to avoid re-promoting the local repulsive
       Q=0 pp-singlet mode as a fake pairing instability.
-    - ``ph_bubble_mode='patchrep'`` is the default. It computes a patch-resolved
-      ph bubble using the partner map and patch energies.
     - The patch-measure fields must match the flow setup whenever you want the
       instability diagnosis to analyze the same discretized problem as the flow.
     """
@@ -70,6 +158,16 @@ class InstabilityConfig:
     patch_measure_mode: str = "unit"
     patch_measure_soft_vf_eps: Optional[float] = None
     patch_measure_normalize_mean: bool = False
+
+    # New multiplet / complex-order analysis
+    analyze_multiplets: bool = True
+    multiplet_top_n: int = 6
+    multiplet_rtol = 1e-2   # 1%
+    multiplet_atol = 1e-8
+    multiplet_eval_floor = 1e-8
+    multiplet_eval_rel_floor: float = 1e-6
+    build_complex_candidates: bool = True
+    max_complex_pairs_per_multiplet: int = 1
 
 
 @dataclass
@@ -105,6 +203,15 @@ class InstabilityResult:
     hermitian_matrix: Optional[np.ndarray] = None
     all_evals_unprojected: Optional[np.ndarray] = None
     all_evals_projected: Optional[np.ndarray] = None
+
+    # New physics-aware diagnostics
+    single_mode_label: Optional[str] = None
+    single_mode_notes: Tuple[str, ...] = ()
+    leading_mode_info: Optional[LeadingModeInfo] = None
+    multiplet_candidates: Tuple[MultipletCandidate, ...] = ()
+    leading_multiplet_candidate: Optional[MultipletCandidate] = None
+    complex_order_candidates: Tuple[ComplexOrderCandidate, ...] = ()
+
     notes: Tuple[str, ...] = ()
 
     def summary_dict(self) -> Dict[str, Any]:
@@ -128,6 +235,11 @@ class InstabilityResult:
             "hermitian_residual": float(self.hermitian_residual),
             "bubble_source": self.bubble.source,
             "bubble_temperature": float(self.bubble.temperature),
+            "single_mode_label": self.single_mode_label,
+            "single_mode_notes": list(self.single_mode_notes),
+            "n_multiplet_candidates": len(self.multiplet_candidates),
+            "leading_multiplet_candidate": None if self.leading_multiplet_candidate is None else self.leading_multiplet_candidate.summary_dict(),
+            "n_complex_order_candidates": len(self.complex_order_candidates),
             "notes": list(self.notes),
         }
 
@@ -167,6 +279,16 @@ def is_q0(Q: Sequence[float], *, tol: float = 1e-10) -> bool:
     return bool(np.allclose(q, 0.0, atol=tol, rtol=0.0))
 
 
+def _is_constant_like(vec: np.ndarray, *, tol: float = 1e-8) -> bool:
+    v = np.asarray(vec, dtype=complex).reshape(-1)
+    n = v.size
+    if n == 0:
+        return False
+    u = np.ones(n, dtype=complex) / np.sqrt(float(n))
+    ov = np.abs(np.vdot(u, v)) / max(np.linalg.norm(v), 1e-30)
+    return bool(abs(1.0 - ov) <= tol)
+
+
 # ---------------------------------------------------------------------------
 # Bubble construction helpers
 # ---------------------------------------------------------------------------
@@ -196,21 +318,12 @@ def _resolve_measure_config(
     ctx_eps = transfer_context.get("patch_measure_soft_vf_eps", None)
     ctx_norm = transfer_context.get("patch_measure_normalize_mean", None)
 
-    if ctx_mode is not None:
-        if str(ctx_mode) != mode:
-            notes.append(
-                f"measure_mode_override: config={mode}, context={ctx_mode}; using config"
-            )
-    if ctx_eps is not None and eps is not None:
-        if float(ctx_eps) != float(eps):
-            notes.append(
-                f"measure_soft_vf_eps_override: config={eps}, context={ctx_eps}; using config"
-            )
-    if ctx_norm is not None:
-        if bool(ctx_norm) != norm:
-            notes.append(
-                f"measure_normalize_override: config={norm}, context={bool(ctx_norm)}; using config"
-            )
+    if ctx_mode is not None and str(ctx_mode) != mode:
+        notes.append(f"measure_mode_override: config={mode}, context={ctx_mode}; using config")
+    if ctx_eps is not None and eps is not None and float(ctx_eps) != float(eps):
+        notes.append(f"measure_soft_vf_eps_override: config={eps}, context={ctx_eps}; using config")
+    if ctx_norm is not None and bool(ctx_norm) != norm:
+        notes.append(f"measure_normalize_override: config={norm}, context={bool(ctx_norm)}; using config")
 
     return mode, eps, norm, tuple(notes)
 
@@ -256,7 +369,7 @@ def _pp_shift_from_context(
 
 
 def _sanitize_bubble_weights(weights: np.ndarray, *, floor: Optional[float] = 0.0) -> Tuple[np.ndarray, Tuple[str, ...]]:
-    notes = []
+    notes: List[str] = []
     arr = np.asarray(weights)
     if np.iscomplexobj(arr):
         imag_max = float(np.max(np.abs(np.imag(arr)))) if arr.size else 0.0
@@ -267,8 +380,7 @@ def _sanitize_bubble_weights(weights: np.ndarray, *, floor: Optional[float] = 0.
     if floor is not None:
         neg_mask = arr < floor
         if np.any(neg_mask):
-            nneg = int(np.count_nonzero(neg_mask))
-            notes.append(f"bubble_weights_clipped_count={nneg}")
+            notes.append(f"bubble_weights_clipped_count={int(np.count_nonzero(neg_mask))}")
             arr = arr.copy()
             arr[neg_mask] = float(floor)
     return arr, tuple(notes)
@@ -285,7 +397,6 @@ def build_ph_bubble_weights_internal_cache(
     patch_measure_soft_vf_eps: Optional[float] = None,
     patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
-    """Legacy ph bubble path: directly reuse flow internal-cache weights."""
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
     partner, residual = _ph_shift_from_context(patchsets, transfer_context, Q)
     legacy = build_ph_internal_cache_vec(
@@ -324,7 +435,6 @@ def build_ph_bubble_weights_patchrep(
     patch_measure_soft_vf_eps: Optional[float] = None,
     patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
-    """Patch-representative ph bubble with synchronized patch measure."""
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
     partner, residual = _ph_shift_from_context(patchsets, transfer_context, Q)
     ps_src = patchset_for_spin(patchsets, "up")
@@ -345,7 +455,8 @@ def build_ph_bubble_weights_patchrep(
             bubble_dot_ph(float(eps_src[i]), float(eps_tgt[int(partner[i])]), flow_config)
             for i in np.flatnonzero(valid)
         ]
-        weights[np.flatnonzero(valid)] = np.asarray(measure_src[np.flatnonzero(valid)], dtype=float) * np.asarray(vals, dtype=complex)
+        idx = np.flatnonzero(valid)
+        weights[idx] = np.asarray(measure_src[idx], dtype=float) * np.asarray(vals, dtype=complex)
 
     weights, notes = _sanitize_bubble_weights(weights, floor=bubble_floor)
     notes = tuple(list(notes) + [
@@ -413,7 +524,6 @@ def build_pp_bubble_weights(
     patch_measure_soft_vf_eps: Optional[float] = None,
     patch_measure_normalize_mean: bool = False,
 ) -> BubbleWeights:
-    """Build patch-diagonal pp bubble weights using the same helper as the flow."""
     Q = canonicalize_q_for_patchsets(patchsets, channel_kernel.Q)
     partner, residual = _pp_shift_from_context(patchsets, transfer_context, Q)
     legacy = build_pp_internal_cache_vec(
@@ -470,8 +580,6 @@ def _extract_patch_eigvec(patch: object, patch_index: Optional[int] = None) -> n
 def build_local_gram_projection_basis(patchsets: PatchSetMap) -> np.ndarray:
     """Construct the Q=0 pp local Gram basis span{w_A, w_B, w_C}."""
     ps = patchset_for_spin(patchsets, "up")
-    if getattr(ps, "Npatch", None) is None:
-        raise ValueError("Patch set does not expose Npatch.")
     npatch = int(ps.Npatch)
     if npatch <= 0:
         raise ValueError("Patch set is empty.")
@@ -510,6 +618,13 @@ def complement_from_basis(basis_vectors: np.ndarray, *, tol: float = 1e-12) -> n
     keep = vals > 0.5
     C = np.asarray(vecs[:, keep], dtype=complex)
     return _orthonormalize_columns(C, tol=tol)
+
+def project_kernel_to_complement(kernel: np.ndarray, basis_vectors: np.ndarray, *, projection_tol: float = 1e-12) -> np.ndarray:
+    """Project a full-space Hermitian kernel into the complement of basis_vectors."""
+    H = np.asarray(kernel, dtype=complex)
+    C = complement_from_basis(basis_vectors, tol=projection_tol)
+    return C.conjugate().T @ H @ C
+
 
 
 # ---------------------------------------------------------------------------
@@ -558,14 +673,241 @@ def build_instability_operator(
     return C.conjugate().T @ M @ C
 
 
-def _leading_eig(operator: np.ndarray, *, store_all: bool = False) -> Tuple[float, np.ndarray, Optional[np.ndarray]]:
+def _eigh_desc(operator: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     H = np.asarray(operator, dtype=complex)
     vals, vecs = np.linalg.eigh(H)
-    idx = int(np.argmax(vals))
-    leading_eval = float(np.real(vals[idx]))
-    leading_evec = np.asarray(vecs[:, idx], dtype=complex)
+    order = np.argsort(-vals)
+    return np.asarray(vals[order], dtype=float), np.asarray(vecs[:, order], dtype=complex)
+
+
+def _leading_eig(operator: np.ndarray, *, store_all: bool = False) -> Tuple[float, np.ndarray, Optional[np.ndarray]]:
+    vals, vecs = _eigh_desc(operator)
+    leading_eval = float(vals[0]) if vals.size else 0.0
+    leading_evec = np.asarray(vecs[:, 0], dtype=complex) if vecs.size else np.zeros((operator.shape[0],), dtype=complex)
     all_vals = np.asarray(vals, dtype=float) if store_all else None
     return leading_eval, leading_evec, all_vals
+
+
+def _degenerate_groups_from_sorted_evals(
+    evals: np.ndarray,
+    *,
+    top_n: int,
+    atol: float,
+    rtol: float,
+) -> List[np.ndarray]:
+    vals = np.asarray(evals, dtype=float)[: int(top_n)]
+    if vals.size == 0:
+        return []
+    groups: List[List[int]] = []
+    current: List[int] = [0]
+    for i in range(1, vals.size):
+        ref = max(abs(vals[i - 1]), abs(vals[i]), 1.0)
+        close = abs(vals[i] - vals[i - 1]) <= (atol + rtol * ref)
+        if close:
+            current.append(i)
+        else:
+            groups.append(current)
+            current = [i]
+    groups.append(current)
+    return [np.asarray(g, dtype=int) for g in groups]
+
+
+# ---------------------------------------------------------------------------
+# Physics-aware classification helpers
+# ---------------------------------------------------------------------------
+
+
+def classify_single_mode_candidate(
+    channel_name: str,
+    channel_type: str,
+    spin_structure: str,
+    Q: Sequence[float],
+    leading_evec: np.ndarray,
+    *,
+    q0_tol: float = 1e-10,
+) -> Tuple[str, Tuple[str, ...]]:
+    q0 = is_q0(Q, tol=q0_tol)
+    const_like = _is_constant_like(leading_evec)
+    notes: List[str] = [f"constant_like={const_like}", f"q0={q0}"]
+
+    if channel_type == "ph" and spin_structure == "spin":
+        if q0:
+            return ("FM" if const_like else "spin_nematic_like_or_q0_spin_bond_like", tuple(notes))
+        return ("SDW" if const_like else "sBO", tuple(notes))
+
+    if channel_type == "ph" and spin_structure == "charge":
+        if q0:
+            return ("uniform_charge_or_landau" if const_like else "PI_or_charge_nematic", tuple(notes))
+        return ("CDW" if const_like else "cBO", tuple(notes))
+
+    if channel_type == "pp" and spin_structure == "singlet":
+        return (("singlet_SC" if q0 else "PDW_singlet"), tuple(notes))
+
+    if channel_type == "pp" and spin_structure == "triplet":
+        return (("triplet_SC" if q0 else "PDW_triplet"), tuple(notes))
+
+    return ("unknown_single_mode", tuple(notes))
+
+
+def _classify_multiplet_candidate(
+    channel_name: str,
+    channel_type: str,
+    spin_structure: str,
+    Q: Sequence[float],
+    dimension: int,
+    *,
+    q0_tol: float = 1e-10,
+) -> str:
+    q0 = is_q0(Q, tol=q0_tol)
+    if dimension <= 1:
+        return "single_mode"
+    if channel_type == "ph" and spin_structure == "charge":
+        return "PI_irrep" if q0 else "cBO_irrep"
+    if channel_type == "ph" and spin_structure == "spin":
+        return "q0_spin_irrep" if q0 else "sBO_irrep"
+    if channel_type == "pp" and spin_structure == "singlet":
+        return "singlet_SC_irrep" if q0 else "PDW_singlet_irrep"
+    if channel_type == "pp" and spin_structure == "triplet":
+        return "triplet_SC_irrep" if q0 else "PDW_triplet_irrep"
+    return "unknown_irrep"
+
+
+def analyze_operator_multiplets(
+    *,
+    operator: np.ndarray,
+    channel_kernel: ChannelKernel,
+    source: str,
+    config: InstabilityConfig,
+    projection_name: Optional[str] = None,
+) -> List[MultipletCandidate]:
+    """Analyze near-degenerate leading subspaces of a Hermitian matrix.
+
+    Despite the historical name, this function is now intended to be used on
+    the Hermitian channel kernel (or its projected complement-space version),
+    not on the bubble-dressed operator. This makes irrep / form-factor
+    detection much more robust against tiny bubble scales.
+    """
+    vals, vecs = _eigh_desc(operator)
+    if vals.size == 0:
+        return []
+
+    channel_name = str(channel_kernel.name)
+    channel_type = infer_channel_type(channel_kernel)
+    spin_structure = infer_spin_structure(channel_kernel)
+    q0 = is_q0(channel_kernel.Q, tol=config.q0_tol)
+
+    leading_abs = float(abs(vals[0]))
+    floor_abs = max(float(config.multiplet_eval_floor), float(config.multiplet_eval_rel_floor) * leading_abs)
+
+    # If even the leading mode is below floor, do not report a physical multiplet.
+    if leading_abs < floor_abs:
+        return []
+
+    n = min(int(config.multiplet_top_n), vals.size)
+    # Only track the leading contiguous group that contains index 0.
+    group = [0]
+    for i in range(1, n):
+        if abs(vals[i]) < floor_abs:
+            break
+        ref = max(abs(vals[i - 1]), abs(vals[i]), abs(vals[0]), 1.0)
+        close = abs(vals[i] - vals[i - 1]) <= (config.multiplet_atol + config.multiplet_rtol * ref)
+        if close:
+            group.append(i)
+        else:
+            break
+
+    g = np.asarray(group, dtype=int)
+    g_evals = np.asarray(vals[g], dtype=float)
+    g_vecs = np.asarray(vecs[:, g], dtype=complex)
+    dim = int(g.size)
+    eval_max_abs = float(np.max(np.abs(g_evals))) if g_evals.size else 0.0
+    spread_abs = float(np.max(g_evals) - np.min(g_evals)) if g_evals.size else 0.0
+    denom = max(float(np.max(np.abs(g_evals))), 1.0)
+    spread_rel = float(spread_abs / denom)
+    notes: List[str] = []
+    degeneracy_type = "physical_irrep_like"
+    physical = dim > 1
+
+    # Special notes for projected Q=0 charge / pp-singlet cases.
+    if channel_type == "ph" and spin_structure == "charge" and q0:
+        if projection_name == "uniform_q0_charge":
+            notes.append("uniform_q0_charge_projected")
+    if channel_type == "pp" and spin_structure == "singlet" and q0 and projection_name == "local_gram_q0_pp_singlet":
+        notes.append("local_gram_projection_applied")
+
+    return [
+        MultipletCandidate(
+            channel_name=channel_name,
+            channel_type=channel_type,
+            spin_structure=spin_structure,
+            Q=np.asarray(channel_kernel.Q, dtype=float),
+            source=source,
+            indices=g,
+            evals=g_evals,
+            basis_vectors=g_vecs,
+            dimension=dim,
+            spread_abs=spread_abs,
+            spread_rel=spread_rel,
+            eval_max_abs=eval_max_abs,
+            degeneracy_type=degeneracy_type,
+            physical_irrep_like=physical,
+            notes=tuple(notes + [f"floor_abs={floor_abs:.3e}"]),
+        )
+    ]
+
+
+def _pick_leading_physical_multiplet(candidates: Sequence[MultipletCandidate]) -> Optional[MultipletCandidate]:
+    if not candidates:
+        return None
+    for cand in candidates:
+        if cand.indices.size > 0 and int(cand.indices[0]) == 0 and cand.physical_irrep_like and cand.dimension > 1:
+            return cand
+    return None
+
+
+def build_complex_order_candidates(
+    multiplet: MultipletCandidate,
+    *,
+    max_pairs: int = 1,
+    q0_tol: float = 1e-10,
+) -> List[ComplexOrderCandidate]:
+    if multiplet.dimension < 2:
+        return []
+    B = np.asarray(multiplet.basis_vectors, dtype=complex)
+    out: List[ComplexOrderCandidate] = []
+    npairs = 0
+    for i in range(multiplet.dimension):
+        for j in range(i + 1, multiplet.dimension):
+            if npairs >= max_pairs:
+                return out
+            f1 = B[:, i]
+            f2 = B[:, j]
+            for combo_type, vec in (("plus_i", f1 + 1j * f2), ("minus_i", f1 - 1j * f2)):
+                if multiplet.channel_type == "ph" and multiplet.spin_structure == "charge":
+                    label = "charge_loop_current_possible"
+                elif multiplet.channel_type == "ph" and multiplet.spin_structure == "spin":
+                    label = "spin_loop_current_possible"
+                elif multiplet.channel_type == "pp":
+                    label = "chiral_SC_possible"
+                else:
+                    label = "complex_order_possible"
+                out.append(
+                    ComplexOrderCandidate(
+                        parent_source=multiplet.source,
+                        channel_name=multiplet.channel_name,
+                        channel_type=multiplet.channel_type,
+                        spin_structure=multiplet.spin_structure,
+                        Q=np.asarray(multiplet.Q, dtype=float),
+                        combo_type=combo_type,
+                        basis_indices=(int(multiplet.indices[i]), int(multiplet.indices[j])),
+                        vector_complex=np.asarray(vec / max(np.linalg.norm(vec), 1e-30), dtype=complex),
+                        candidate_label=label,
+                        tr_breaking_possible=True,
+                        notes=(f"built_from_dim={multiplet.dimension}", f"q0={is_q0(multiplet.Q, tol=q0_tol)}"),
+                    )
+                )
+            npairs += 1
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -589,7 +931,7 @@ def diagnose_channel_instability(
 
     measure_mode, measure_eps, measure_norm, measure_notes = _resolve_measure_config(transfer_context, config)
 
-    notes = list(measure_notes)
+    notes: List[str] = list(measure_notes)
     if channel_type == "ph":
         bubble = build_ph_bubble_weights(
             channel_kernel,
@@ -680,8 +1022,49 @@ def diagnose_channel_instability(
         notes.append(f"projection_applied={projection_name}, rank={projection_rank}")
 
     score = eval_proj if (projected_is_default and eval_proj is not None) else eval_unproj
-    leading_eval = score
+    leading_eval = float(score)
     leading_evec = evec_proj_full if (projected_is_default and evec_proj_full is not None) else evec_unproj
+    leading_source = projection_name if (projected_is_default and projection_name is not None) else "unprojected"
+
+    single_label, single_notes = classify_single_mode_candidate(
+        str(channel_kernel.name), channel_type, spin_structure, channel_kernel.Q, leading_evec, q0_tol=config.q0_tol
+    )
+
+    multiplet_candidates: List[MultipletCandidate] = []
+    leading_multiplet_candidate: Optional[MultipletCandidate] = None
+    complex_candidates: List[ComplexOrderCandidate] = []
+
+    if config.analyze_multiplets:
+        # Detect irrep / degeneracy on the Hermitian channel kernel itself, not
+        # on the bubble-dressed operator. This is much more robust against tiny
+        # bubble scales and preserves the form-factor structure.
+        multiplet_candidates.extend(
+            analyze_operator_multiplets(
+                operator=H,
+                channel_kernel=channel_kernel,
+                source="unprojected",
+                config=config,
+                projection_name=None,
+            )
+        )
+        if projection_basis_store is not None and projection_name is not None:
+            H_proj = project_kernel_to_complement(H, projection_basis_store, projection_tol=config.projection_tol)
+            multiplet_candidates.extend(
+                analyze_operator_multiplets(
+                    operator=H_proj,
+                    channel_kernel=channel_kernel,
+                    source=str(projection_name),
+                    config=config,
+                    projection_name=projection_name,
+                )
+            )
+        leading_multiplet_candidate = _pick_leading_physical_multiplet(multiplet_candidates)
+        if config.build_complex_candidates and leading_multiplet_candidate is not None:
+            complex_candidates = build_complex_order_candidates(
+                leading_multiplet_candidate,
+                max_pairs=config.max_complex_pairs_per_multiplet,
+                q0_tol=config.q0_tol,
+            )
 
     return InstabilityResult(
         channel_name=str(channel_kernel.name),
@@ -708,6 +1091,18 @@ def diagnose_channel_instability(
         hermitian_matrix=H if config.store_operator_matrices else None,
         all_evals_unprojected=all_unproj,
         all_evals_projected=all_proj,
+        single_mode_label=single_label,
+        single_mode_notes=tuple(single_notes),
+        leading_mode_info=LeadingModeInfo(
+            score=float(score),
+            eval=float(leading_eval),
+            evec=np.asarray(leading_evec, dtype=complex),
+            source=str(leading_source),
+            projection_name=projection_name if projected_is_default else None,
+        ),
+        multiplet_candidates=tuple(multiplet_candidates),
+        leading_multiplet_candidate=leading_multiplet_candidate,
+        complex_order_candidates=tuple(complex_candidates),
         notes=tuple(notes),
     )
 
@@ -739,6 +1134,9 @@ def diagnose_kernel_collection(
 
 __all__ = [
     "BubbleWeights",
+    "LeadingModeInfo",
+    "MultipletCandidate",
+    "ComplexOrderCandidate",
     "InstabilityConfig",
     "InstabilityResult",
     "build_ph_bubble_weights",
@@ -747,8 +1145,12 @@ __all__ = [
     "build_pp_bubble_weights",
     "build_uniform_projection_basis",
     "build_local_gram_projection_basis",
+    "project_kernel_to_complement",
     "build_instability_operator",
     "build_hermitian_kernel",
+    "classify_single_mode_candidate",
+    "analyze_operator_multiplets",
+    "build_complex_order_candidates",
     "diagnose_channel_instability",
     "diagnose_kernel_collection",
     "infer_channel_type",
