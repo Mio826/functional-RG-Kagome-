@@ -602,6 +602,155 @@ def smooth_patch_eigvecs(eigvecs, *, close_loop=True, anchor_method="max_compone
 
 
 # =============================================================================
+# Pairing-compatible regauge (post-processing on built spin-resolved patchsets)
+# =============================================================================
+
+
+def _minus_partner_indices_for_patchset(patchset: PatchSet, *, tol: float = 1e-10):
+    """
+    For each patch p, find the patch index pm such that k_pm == -k_p modulo G.
+
+    Returns
+    -------
+    minus_index : np.ndarray, shape (Npatch,)
+    minus_resid : np.ndarray, shape (Npatch,)
+    """
+    ks = np.asarray([p.k_cart for p in patchset.patches], dtype=float)
+    n = len(ks)
+    minus_index = np.full(n, -1, dtype=int)
+    minus_resid = np.full(n, np.inf, dtype=float)
+
+    class _TmpModel:
+        pass
+
+    tmp = _TmpModel()
+    tmp.b1 = np.asarray(patchset.b1, dtype=float)
+    tmp.b2 = np.asarray(patchset.b2, dtype=float)
+
+    for i, k in enumerate(ks):
+        target = -np.asarray(k, dtype=float)
+        best_j = None
+        best_d = np.inf
+        for j, kj in enumerate(ks):
+            d = _periodic_distance(target, kj, tmp)
+            if d < best_d - 1e-14:
+                best_d = d
+                best_j = j
+        minus_index[i] = int(best_j)
+        minus_resid[i] = float(best_d)
+
+    if np.max(minus_resid) > tol:
+        raise ValueError(
+            f"Could not find exact -k partners on patchset within tol={tol}. "
+            f"max residual = {np.max(minus_resid)}"
+        )
+
+    return minus_index, minus_resid
+
+
+
+def _pairing_defect_single_patch(u_up_p, u_up_pm, u_dn_p, u_dn_pm):
+    """
+    Defect vector controlling pure-onsite-U pp-triplet cancellation at Q=0.
+
+    Exact cancellation requires componentwise:
+        conj(u_up(-k)) * conj(u_dn(k)) == conj(u_up(k)) * conj(u_dn(-k))
+    """
+    g_raw = np.conjugate(u_up_pm) * np.conjugate(u_dn_p)
+    g_ex = np.conjugate(u_up_p) * np.conjugate(u_dn_pm)
+    return g_raw - g_ex
+
+
+
+def pairing_gauge_defect(patchsets: Dict[str, PatchSet], *, spins=("up", "dn")) -> np.ndarray:
+    """
+    Return the per-patch, per-orbital pairing-gauge defect tensor.
+
+    This is useful as a sanity check after gauge fixing. For a patchset map with a
+    pairing-compatible gauge, this tensor should be numerically close to zero.
+    """
+    s_up, s_dn = spins
+    if s_up not in patchsets or s_dn not in patchsets:
+        raise KeyError(f"patchsets must contain spins {spins}")
+
+    PSu = patchsets[s_up]
+    PSd = patchsets[s_dn]
+
+    if PSu.Npatch != PSd.Npatch:
+        raise ValueError("up/dn patchsets must have the same Npatch")
+
+    ku = np.asarray([p.k_cart for p in PSu.patches], dtype=float)
+    kd = np.asarray([p.k_cart for p in PSd.patches], dtype=float)
+    if not np.allclose(ku, kd, atol=1e-12):
+        raise ValueError("up/dn patchsets must have identical patch k-points in the same order")
+
+    minus_index, _ = _minus_partner_indices_for_patchset(PSu)
+
+    Uu = np.asarray([p.eigvec for p in PSu.patches], dtype=complex)
+    Ud = np.asarray([p.eigvec for p in PSd.patches], dtype=complex)
+
+    defect = np.zeros((PSu.Npatch, Uu.shape[1]), dtype=complex)
+    for p in range(PSu.Npatch):
+        pm = int(minus_index[p])
+        defect[p] = _pairing_defect_single_patch(Uu[p], Uu[pm], Ud[p], Ud[pm])
+    return defect
+
+
+
+def regauge_patchsets_pairing_compatible(patchsets):
+    """
+    Enforce exact pairing-compatible gauge:
+        u(-k) = u(k)^*
+    for BOTH spin sectors.
+
+    This guarantees exact cancellation of pure-U pp-triplet at Q=0.
+    """
+    PSu = patchsets["up"]
+    PSd = patchsets["dn"]
+
+    minus_index, _ = _minus_partner_indices_for_patchset(PSu)
+
+    Uu = np.asarray([p.eigvec for p in PSu.patches], dtype=complex).copy()
+    Ud = np.asarray([p.eigvec for p in PSd.patches], dtype=complex).copy()
+
+    visited = np.zeros(PSu.Npatch, dtype=bool)
+
+    for p in range(PSu.Npatch):
+        if visited[p]:
+            continue
+
+        pm = minus_index[p]
+
+        visited[p] = True
+        visited[pm] = True
+
+        if pm == p:
+            # TRIM-like point, skip
+            continue
+
+        # enforce conjugation symmetry
+        Uu[pm] = np.conjugate(Uu[p])
+        Ud[pm] = np.conjugate(Ud[p])
+
+        # normalize again
+        Uu[pm] = _normalize_eigvec(Uu[pm])
+        Ud[pm] = _normalize_eigvec(Ud[pm])
+
+    out = dict(patchsets)
+    out["up"] = PSu.copy_with_eigvecs(
+        Uu,
+        gauge_method="pairing_conjugate_enforced",
+        gauge_loop_phase=PSu.gauge_loop_phase,
+    )
+    out["dn"] = PSd.copy_with_eigvecs(
+        Ud,
+        gauge_method="pairing_conjugate_enforced",
+        gauge_loop_phase=PSd.gauge_loop_phase,
+    )
+
+    return out
+
+# =============================================================================
 # Patch geometry on the kept loop
 # =============================================================================
 
