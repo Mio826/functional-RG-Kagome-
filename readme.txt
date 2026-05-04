@@ -612,4 +612,169 @@ The cleaned-up codebase is built around four principles:
 4. Keep numerical and physical semantics aligned.
    If the flow uses a certain patch measure, instability diagnosis must use the same measure. If a mode is projected out, it should be clear that this is a diagnosis-stage filter, not a change to the flow equation.
 
+7. Candidate diagnosis and Level-3 order-parameter fingerprint diagnosis
+
+The project uses two separate diagnosis files after the RG flow and channel reconstruction have already been performed: candidate_diagnosis.py and order_parameter_diagnosis.py. They should not be confused with instability.py. The instability module decides which channel and transfer momentum are becoming unstable, while these two diagnosis files interpret the structure of the resulting patch-space eigenvectors.
+
+7.1 candidate_diagnosis.py: Level-2 scalar candidate diagnosis
+
+candidate_diagnosis.py is the Level-2 identification layer. It constructs analytic scalar form factors T_i on the patch set and compares a flowed eigenvector v_i against those candidates. In this layer, an order is represented as a scalar function on patches, usually of the form
+
+    T_i(Q) = <u(k_i+Q)| O_Q(k_i) |u(k_i)>,
+
+or, for Q=0,
+
+    T_i = <u(k_i)| O(k_i) |u(k_i)>.
+
+The file organizes candidates into particle-hole real orders, particle-particle real orders, and particle-hole current/imaginary orders. For PH real orders it includes FM_Q0, the two-component PI_Q0_E2 basis, and finite-M CDW, SDW, CBO, and SBO candidates. For example, FM_Q0 is simply T_i=1. The PI basis uses the two d-wave-like scalar functions
+
+    T_dx2y2(k) = cos(2kx) - cos(kx) cos(sqrt(3) ky),
+    T_dxy(k)   = sqrt(3) sin(kx) sin(sqrt(3) ky).
+
+For Q=M density orders, the candidate is
+
+    T_i^CDW/SDW = <u(k_i+Q)| D_m |u(k_i)>,
+
+where D_m is a diagonal sublattice matrix. For Q=M bond orders,
+
+    T_i^CBO/SBO = sin(Q · k_i) <u(k_i+Q)| B_m |u(k_i)>,
+
+where B_m is an off-diagonal real bond matrix. The sin(Q · k_i) factor is part of the Level-2 candidate convention; it should not be automatically inserted into raw Level-3 bond reconstruction. The current-candidate part also includes Q=0 loop-current representatives and four Q=M high-symmetry proxy templates LC_M_D6A, LC_M_D6B, LC_M_D6C, and LC_M_D6PA. These Q=M current candidates are explicitly intended as proxy templates for sector/subspace identification, not as a full bond-by-bond reconstruction of every current arrow in the 2×2 flux patterns. The file itself documents this limitation and notes that these Q=M current classes are suitable for overlap/rank tests rather than literal real-space reconstruction. :contentReference[oaicite:0]{index=0}
+
+The main mathematical operation in candidate_diagnosis.py is therefore an overlap or subspace comparison between v and the candidate vector T. This tells whether a leading eigenvector resembles a proposed order in scalar patch space. It does not reconstruct real-space site, bond, or current textures by itself.
+
+7.1.1 Known limitation: Q=M PH-real Level-2 candidate diagnosis
+
+During validation of Level-2 PH-real candidates, we identified a fundamental issue in the
+scalar-template formulation for finite-Q (Q=M) density-type orders (CDW/SDW).
+
+In Level-2, candidates are constructed as
+
+    T_i(Q) = <u(k_i+Q)| O |u(k_i)>,
+
+where O is an orbital (sublattice) operator such as a diagonal density matrix D or a bond
+matrix B. For Q=M, the conventional implementation uses a single operator D_m or B_m
+selected according to the M-direction.
+
+However, in the Kagome van Hove patch setting, Bloch states on the Fermi surface are
+strongly sublattice-polarized. As a result, for some Q directions and some choices of O,
+the matrix element
+
+    <u(k_i+Q)| O |u(k_i)>
+
+can become nearly zero for all patches, even when the corresponding physical instability
+is strong. This leads to:
+
+    - vanishing template norms for certain Q sectors,
+    - artificially suppressed overlaps and projected scores,
+    - apparent breaking of M1/M2/M3 symmetry at Level-2,
+      despite exact degeneracy at the kernel (Level-1) level.
+
+This is not a numerical error in the flow, but a limitation of representing a finite-Q
+density order using a single fixed orbital matrix in Bloch basis.
+
+To mitigate this issue, the Q=M PH-real candidates are upgraded from single-vector
+templates to orbital subspaces:
+
+    Density-type (CDW/SDW):
+        span{ D_AB, D_AC, D_BC }
+
+    Bond-type (CBO/SBO):
+        span{ B_AB, B_AC, B_BC }
+
+and Level-2 comparison is performed using subspace overlap and projected score:
+
+    overlap(v, span{T})  and  max_{T in span} <T|K|T>.
+
+This significantly stabilizes the diagnosis and removes most of the artificial asymmetry.
+
+However, even with the subspace formulation, small differences between M1/M2/M3 may
+remain. These residual differences originate from:
+
+    - patch discretization (finite sampling of the Fermi surface),
+    - Bloch-state orbital rotation across different Q directions,
+    - the fact that Level-2 operates in scalar patch space rather than full real-space
+      operator space.
+
+Therefore, Level-2 Q=M PH-real results should be interpreted as:
+
+    - a classification of order type (density-like vs bond-like),
+    - not a strict test of equality between symmetry-related M directions.
+
+In particular, exact M1/M2/M3 degeneracy should be assessed at Level-1 (kernel spectrum)
+or via Level-3 real-space reconstruction, not by comparing individual Level-2 bars.
+
+7.2 order_parameter_diagnosis.py: Level-3 orbital/bond/current fingerprint diagnosis
+
+order_parameter_diagnosis.py is the unified Level-3 post-processing module. It combines the previous Q=0, Q=M real-order, and Q=M current-proxy files into one module. Its purpose is to take a scalar patch-space fRG eigenvector v_i and lift it back into orbital/bond/current fingerprints. It does not compute RG flows, susceptibilities, new eigenvalues, or true many-body expectation values. It is only a pattern-reconstruction tool for interpreting an already-obtained scalar mode. :contentReference[oaicite:1]{index=1}
+
+For Q=0 particle-hole modes, the basic lift is
+
+    rho_i[a,b] = v_i u_a*(k_i) u_b(k_i).
+
+From this lifted orbital density matrix, FM-like onsite fingerprints are computed as
+
+    S_a = sum_i w_i rho_i[a,a]
+        = sum_i w_i v_i |u_a(k_i)|^2.
+
+Thus a uniform FM mode should give comparable onsite amplitudes on A, B, and C sublattices, while a sublattice-polarized mode would show unequal S_a. PI is treated differently: it is not forced into a fake real-space current or bond pattern. It is diagnosed as a momentum-space/Fermi-surface deformation by projecting v_i onto the PI scalar basis functions listed above.
+
+For Q=0 bond and current fingerprints, the module constructs an oriented-bond bilinear for each bond ell = (a -> b + delta_ell):
+
+    R_ell[v] = t_ell sum_i w_i exp(i k_i · delta_ell) rho_i[a,b]
+             = t_ell sum_i w_i exp(i k_i · delta_ell)
+               v_i u_a*(k_i) u_b(k_i).
+
+The real bond component and current component are then defined from the same complex number R_ell:
+
+    bond_ell    = 2 Re R_ell,
+    current_ell = 2 Im R_ell.
+
+This is important because bond order and current order are not separate ad hoc constructions; they are the real and imaginary parts of the same oriented bond expectation. The code includes target-pattern scoring for Q=0 Nagaosa and Flow-A current textures by comparing the reconstructed current vector J_ell against a chosen sign pattern. This is why Q=0 loop current can be Level-3 visible even when a naive Level-2 scalar current template vanishes on the kagome van-Hove patches.
+
+For Q=M real orders, the finite-Q lift is
+
+    rho_i[a,b] = v_i u_a*(k_i+Q) u_b(k_i).
+
+In strict patch mode, this is only evaluated on the retained-patch partner set
+
+    V_Q = { i | k_i + Q equals another retained patch k_j modulo a reciprocal lattice vector }.
+
+Invalid rows are set to NaN and ignored. This strict mask is intentional: it prevents the code from silently replacing k_i+Q by an approximate nearest patch when the partner is not actually retained. For a single M transfer in the exact-M patch set, only about one third of the patches may have valid partners.
+
+The Q=M density fingerprint uses
+
+    A_D[v] = sum_{i in V_Q} w_i Tr[D_m rho_i]
+           = sum_{i in V_Q} w_i v_i <u(k_j)|D_m|u(k_i)>,
+
+where D_m is the diagonal sublattice matrix for the chosen M index. This is used for both CDW and SDW; the difference is the physical channel interpretation, charge or spin. The Q=M raw bond fingerprint uses
+
+    A_B[v] = sum_{i in V_Q} w_i Tr[B_m rho_i]
+           = sum_{i in V_Q} w_i v_i <u(k_j)|B_m|u(k_i)>.
+
+By default, no sin(Q · k_i) factor is included in this Level-3 raw bond reconstruction. If use_candidate_phase=True is explicitly requested, the code multiplies by sin(Q · k_i), but that is a Level-2 candidate-style convention rather than the raw Level-3 fingerprint. The distinction matters because the sine factor may already be absorbed into a Level-2 candidate vector v_i.
+
+A key consequence is that CBO/SBO can be visible in Level 2 but invisible in strict Level 3. Level 2 evaluates <u(k_i+Q)|B_m|u(k_i)> for all patches by direct evaluation of u(k_i+Q). Strict Level 3 only samples the subset V_Q. In the current exact-M patch geometry, the raw bond matrix element on this strict subset can vanish:
+
+    K_i^B,strict = <u(k_j)|B_m|u(k_i)> ≈ 0,  i in V_Q.
+
+Then for any normalized v,
+
+    |A_B[v]| = |sum_{i in V_Q} w_i v_i K_i^B,strict|
+             <= ||v||_w ||K^B,strict||_w
+             ≈ 0.
+
+This is a limitation of the strict retained-partner Level-3 reconstruction, not proof that CBO/SBO are absent as Level-2 candidate orders.
+
+Finally, order_parameter_diagnosis.py also contains Q=M current proxy diagnostics for LC_M_D6A, LC_M_D6B, LC_M_D6C, and LC_M_D6PA. These use scalar proxy kernels
+
+    T_i^alpha(Q) =
+        sum_{cell c, bond b}
+        s_c^alpha eta_b^alpha exp(i Q · R_c)
+        <u(k_i+Q)|J_b|u(k_i)>,
+
+where J_b is an orbital current matrix on AB, AC, or BC. The module supports a direct mode, where u(k_i+Q) is evaluated directly from the local spin block, and a strict mode, where only retained patch partners are used. Because these four current proxy templates are generally not orthogonal, the module reports a Gram matrix, normalized Gram matrix, singular values, effective rank, and subspace overlap. The largest individual overlap should not be interpreted as a unique current-class winner unless the normalized Gram matrix is close to diagonal. The combined module explicitly states that these Q=M current proxies are pattern fingerprints and not full real-space flux-arrow reconstructions. :contentReference[oaicite:2]{index=2}
+
+In short, candidate_diagnosis.py answers: “Does this eigenvector look like a known scalar candidate form factor?” order_parameter_diagnosis.py answers: “If I lift this scalar eigenvector back into orbital space, what onsite, bond, current, or finite-Q fingerprint does it produce?” Both are diagnosis layers, not flow layers, and both should be interpreted as pattern-identification tools rather than independent calculations of physical order-parameter magnitudes.
+
 End of README.
