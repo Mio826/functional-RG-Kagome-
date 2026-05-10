@@ -264,6 +264,12 @@ class FRGFlowSolverSZ0:
     def _precompute_transfer_tables(self) -> None:
         self._pp_q_index: Dict[Tuple[str, str], np.ndarray] = {}
         self._phd_q_index_plus: Dict[Tuple[str, str], np.ndarray] = {}
+        # For the direct particle-hole loop, the external transfer is still
+        # Q = k_out - k_in = k3 - k1, but the internal partner required by
+        # V(1,a;3,b) is b = a - Q.  Therefore we also keep a minus-transfer
+        # lookup table.  This avoids accidentally using b = a + Q in the phd
+        # one-loop contribution.
+        self._phd_q_index_minus: Dict[Tuple[str, str], np.ndarray] = {}
         self._phc_q_index_plus: Dict[Tuple[str, str], np.ndarray] = {}
         self._phc_q_index_minus: Dict[Tuple[str, str], np.ndarray] = {}
 
@@ -273,16 +279,22 @@ class FRGFlowSolverSZ0:
                 ktgts = self._patch_k[s_tgt]
                 arr_pp = np.zeros((self.Npatch, self.Npatch), dtype=int)
                 arr_phd_plus = np.zeros((self.Npatch, self.Npatch), dtype=int)
+                arr_phd_minus = np.zeros((self.Npatch, self.Npatch), dtype=int)
                 arr_phc_plus = np.zeros((self.Npatch, self.Npatch), dtype=int)
                 arr_phc_minus = np.zeros((self.Npatch, self.Npatch), dtype=int)
                 for p_src, k_src in enumerate(ksrcs):
                     for p_tgt, k_tgt in enumerate(ktgts):
                         arr_pp[p_src, p_tgt] = self.pp_grid.nearest_index(k_src + k_tgt)
+                        # External direct-ph transfer convention: Q = k_tgt - k_src.
                         arr_phd_plus[p_src, p_tgt] = self.phd_grid.nearest_index(k_tgt - k_src)
+                        # Internal direct-ph partner needed by the one-loop routing:
+                        # b = a - Q, hence the table for k_src - k_tgt.
+                        arr_phd_minus[p_src, p_tgt] = self.phd_grid.nearest_index(k_src - k_tgt)
                         arr_phc_plus[p_src, p_tgt] = self.phc_grid.nearest_index(k_tgt - k_src)
                         arr_phc_minus[p_src, p_tgt] = self.phc_grid.nearest_index(k_src - k_tgt)
                 self._pp_q_index[(s_src, s_tgt)] = arr_pp
                 self._phd_q_index_plus[(s_src, s_tgt)] = arr_phd_plus
+                self._phd_q_index_minus[(s_src, s_tgt)] = arr_phd_minus
                 self._phc_q_index_plus[(s_src, s_tgt)] = arr_phc_plus
                 self._phc_q_index_minus[(s_src, s_tgt)] = arr_phc_minus
 
@@ -298,14 +310,18 @@ class FRGFlowSolverSZ0:
         )
 
     def _partner_map_phd_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float]):
+        # Direct PH routing used in compute_phd_vertex_contribution_sz0:
+        #   V(1,a;3,b) requires k_b = k_a + k_1 - k_3.
+        # With the external direct-PH transfer convention Q = k_3 - k_1,
+        # the internal partner is therefore b = a - Q, not a + Q.
         return partner_map_from_q_index(
             self.patchsets,
-            self._phd_q_index_plus[(normalize_spin(first_spin), normalize_spin(second_spin))],
+            self._phd_q_index_minus[(normalize_spin(first_spin), normalize_spin(second_spin))],
             source_spin=first_spin,
             target_spin=second_spin,
             iq_target=int(iq),
             Q=self.phd_grid.canonicalize(Q),
-            mode="k_plus_Q",
+            mode="k_minus_Q",
         )
 
     def _partner_map_phc_from_iq(self, iq: int, *, first_spin: str, second_spin: str, Q: Sequence[float], mode: str):
@@ -322,7 +338,7 @@ class FRGFlowSolverSZ0:
 
     def _precompute_shift_maps(self) -> None:
         self._pp_qminus: Dict[int, MinimalInternalCache] = {}
-        self._ph_kplus: Dict[int, MinimalInternalCache] = {}
+        self._ph_kminus: Dict[int, MinimalInternalCache] = {}
         self._phc_kplus: Dict[int, MinimalInternalCache] = {}
 
         for iq, Q in enumerate(self.pp_grid.q_list):
@@ -342,7 +358,7 @@ class FRGFlowSolverSZ0:
 
         for iq, Q in enumerate(self.phd_grid.q_list):
             partner, residual = self._partner_map_phd_from_iq(iq, first_spin="up", second_spin="dn", Q=Q)
-            self._ph_kplus[iq] = {
+            self._ph_kminus[iq] = {
                 "partner": np.asarray(partner, dtype=int),
                 "residual": np.asarray(residual, dtype=float),
                 "weights": np.zeros(self.Npatch, dtype=complex),
@@ -431,7 +447,7 @@ class FRGFlowSolverSZ0:
                 "weights": np.asarray(legacy["weights"], dtype=complex),
             }
 
-        for iq, template in self._ph_kplus.items():
+        for iq, template in self._ph_kminus.items():
             legacy = build_ph_internal_cache_vec(
                 self.patchsets,
                 cfg,
@@ -711,6 +727,7 @@ class FRGFlowSolverSZ0:
             "phc_grid": self.phc_grid,
             "pp_q_index": {k: v.copy() for k, v in self._pp_q_index.items()},
             "phd_q_index_plus": {k: v.copy() for k, v in self._phd_q_index_plus.items()},
+            "phd_q_index_minus": {k: v.copy() for k, v in self._phd_q_index_minus.items()},
             "phc_q_index_plus": {k: v.copy() for k, v in self._phc_q_index_plus.items()},
             "phc_q_index_minus": {k: v.copy() for k, v in self._phc_q_index_minus.items()},
             "patch_measure_mode": self.patch_measure_mode,
