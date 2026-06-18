@@ -731,7 +731,136 @@ class KagomeKaneMeleSOC(Noninteracting_Model):
             ])
 
 
-                
+class KagomeRashbaSOC(Noninteracting_Model):
+    """
+    Kagome nearest-neighbor Rashba SOC model.
+
+    parameters:
+        t  : real NN hopping
+        lR : NN Rashba SOC strength
+
+    basis:
+        [A up, A down, B up, B down, C up, C down]
+
+    Rashba convention:
+        H_R = i lR (sigma_x d_y - sigma_y d_x)
+        for a directed NN bond with unit vector d.
+
+    Geometry convention follows KagomeKaneMeleSOC in this file:
+        delta1 = A -> B
+        delta2 = C -> A
+        delta3 = B -> C
+
+    Directed representative bonds used here:
+        A -> B :  delta1
+        A -> C : -delta2
+        B -> C :  delta3
+    """
+
+    def __init__(self, parameters: dict, Bz: float = 0.0, *args, **kwargs):
+        super().__init__()
+
+        required_keys = {"t", "lR"}
+        if not (isinstance(parameters, dict) and parameters.keys() == required_keys):
+            raise ValueError(f"input parameters must be a dict, with .keys = {required_keys}")
+
+        self._parameters = parameters.copy()
+        self.Bz = Bz
+
+        a = 1.0
+
+        self.delta1 = np.array([ a/2,  a*np.sqrt(3)/2])   # A -> B
+        self.delta2 = np.array([ a/2, -a*np.sqrt(3)/2])   # C -> A
+        self.delta3 = np.array([-a,    0.0])              # B -> C
+
+        self.s0 = np.eye(2, dtype=complex)
+        self.sx = np.array([[0, 1], [1, 0]], dtype=complex)
+        self.sy = np.array([[0, -1j], [1j, 0]], dtype=complex)
+        self.sz = np.array([[1, 0], [0, -1]], dtype=complex)
+
+    @property
+    def parameters(self):
+        return self._parameters
+
+    @parameters.setter
+    def parameters(self, value):
+        required_keys = {"t", "lR"}
+        if not (isinstance(value, dict) and value.keys() == required_keys):
+            raise ValueError(f"input parameters must be a dict, with .keys = {required_keys}")
+
+        if self._parameters != value:
+            self._parameters = value.copy()
+            self.Emin, self.Emax = None, None
+            print(">>reset called")
+
+    @property
+    def b1(self):
+        return np.array([0.0, 2*np.pi/np.sqrt(3)])
+
+    @property
+    def b2(self):
+        return np.array([np.pi, np.pi/np.sqrt(3)])
+
+    def _rashba_matrix(self, d):
+        """
+        R(d) = sigma_x d_y - sigma_y d_x
+        corresponding to (sigma x d)_z.
+        """
+        d = np.asarray(d, dtype=float)
+        dhat = d / np.linalg.norm(d)
+        return dhat[1] * self.sx - dhat[0] * self.sy
+
+    def _pair_block(self, kvec, d):
+        """
+        Bloch block between two sublattices connected by NN bonds +d and -d.
+
+        For +d:
+            T(+d) = -t I + i lR R(d)
+
+        For -d:
+            T(-d) = -t I + i lR R(-d)
+
+        Then:
+            H_ij(k) = T(+d) exp(i k.d) + T(-d) exp(-i k.d)
+        """
+        t = self.parameters["t"]
+        lR = self.parameters["lR"]
+
+        d = np.asarray(d, dtype=float)
+        phase = np.exp(1j * np.dot(kvec, d))
+
+        T_plus = (
+            -t * self.s0
+            + 1j * lR * self._rashba_matrix(d)
+        )
+
+        T_minus = (
+            -t * self.s0
+            + 1j * lR * self._rashba_matrix(-d)
+        )
+
+        return T_plus * phase + T_minus * np.conjugate(phase)
+
+    def Hk(self, kx, ky):
+        kvec = np.array([kx, ky], dtype=float)
+
+        AB = self._pair_block(kvec,  self.delta1)   # A -> B
+        AC = self._pair_block(kvec, -self.delta2)   # A -> C
+        BC = self._pair_block(kvec,  self.delta3)   # B -> C
+
+        Z = np.zeros((2, 2), dtype=complex)
+
+        H = np.block([
+            [Z,             AB,             AC],
+            [AB.conj().T,   Z,              BC],
+            [AC.conj().T,   BC.conj().T,    Z ],
+        ])
+
+        if self.Bz is not None and abs(self.Bz) > 0:
+            H = H + self.Bz * np.kron(np.eye(3), self.sz)
+
+        return H
+        
 class threesites_model_singleorb(Noninteracting_Model):
     """
     Son class, with upcasting function deg Hk
